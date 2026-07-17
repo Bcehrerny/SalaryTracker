@@ -6,5 +6,5 @@ import react from "@vitejs/plugin-react";
 // then base should be "/wage-tracker/"
 export default defineConfig({
   plugins: [react()],
-  base: "/REPO_NAME/",
+  base: "/SalaryTracker/",
 });
