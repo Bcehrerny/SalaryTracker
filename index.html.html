@@ -1,0 +1,86 @@
+
+<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Salary Tracker</title>
+<style>
+body{font-family:Arial,sans-serif;max-width:900px;margin:auto;padding:20px;background:#f5f5f5}
+.card{background:#fff;padding:16px;border-radius:12px;margin:12px 0;box-shadow:0 2px 6px #ccc}
+input,button{padding:8px;margin:4px}
+table{width:100%;border-collapse:collapse}td,th{border-bottom:1px solid #ddd;padding:6px}
+</style></head><body>
+<h1>Salary Tracker</h1>
+<div class="card">
+Hourly Rate <input id="rate" value="14.99" size=5>
+Goal €<input id="goal" value="1000" size=5>
+<button onclick="saveSettings()">Save</button>
+</div>
+
+<div class="card">
+<h3>Add Shift</h3>
+<input type="date" id="d">
+<input type="time" id="s">
+<input type="time" id="e">
+<button onclick="addShift()">Add</button>
+</div>
+
+<div class="card">
+<h3>Add Future Shift</h3>
+<input type="date" id="fd">
+<input type="time" id="fs">
+<input type="time" id="fe">
+<button onclick="addFuture()">Add Future</button>
+</div>
+
+<div class="card">
+<h3>Add Tip</h3>
+<input type="date" id="td">
+<input type="number" id="tip" step="0.01">
+<button onclick="addTip()">Add Tip</button>
+</div>
+
+<div class="card">
+<h2>Dashboard</h2>
+<div id="dash"></div>
+</div>
+
+<div class="card">
+<h2>Monthly Statistics</h2>
+<div id="stats"></div>
+</div>
+
+<div class="card"><h2>Shifts</h2><table id="tbl"></table></div>
+
+<script>
+let settings=JSON.parse(localStorage.settings||'{"rate":14.99,"goal":1000}');
+let shifts=JSON.parse(localStorage.shifts||'[]');
+let future=JSON.parse(localStorage.future||'[]');
+let tips=JSON.parse(localStorage.tips||'[]');
+rate.value=settings.rate;goal.value=settings.goal;
+function save(){localStorage.settings=JSON.stringify(settings);localStorage.shifts=JSON.stringify(shifts);localStorage.future=JSON.stringify(future);localStorage.tips=JSON.stringify(tips);}
+function saveSettings(){settings.rate=parseFloat(rate.value);settings.goal=parseFloat(goal.value);save();render();}
+function hours(a,b){let A=a.split(':');let B=b.split(':');return ((+B[0]*60+ +B[1])-(+A[0]*60+ +A[1]))/60;}
+function calcNet(h){let gross=h*settings.rate;gross+=gross*0.1064;gross*=1.08;return gross*0.949;}
+function addShift(){let h=hours(s.value,e.value);shifts.push({date:d.value,start:s.value,end:e.value,h});save();render();}
+function addFuture(){let h=hours(fs.value,fe.value);future.push({date:fd.value,start:fs.value,end:fe.value,h});save();render();}
+function addTip(){tips.push({date:td.value,amount:parseFloat(tip.value)});save();render();}
+function render(){
+let wh=shifts.reduce((a,b)=>a+b.h,0), fh=future.reduce((a,b)=>a+b.h,0);
+let tipsum=tips.reduce((a,b)=>a+b.amount,0);
+let net=calcNet(wh), pred=calcNet(wh+fh);
+dash.innerHTML=`Worked Hours: ${wh.toFixed(2)}<br>
+Future Hours: ${fh.toFixed(2)}<br>
+Net Salary: €${net.toFixed(2)}<br>
+Tips: €${tipsum.toFixed(2)}<br>
+Total Income: €${(net+tipsum).toFixed(2)}<br>
+Predicted Net: €${pred.toFixed(2)}<br>
+Need ${(Math.max(0,(settings.goal-net))/17).toFixed(1)} hours to goal`;
+stats.innerHTML=`Worked Days: ${shifts.length}<br>
+Average Shift: ${(wh/(shifts.length||1)).toFixed(2)} h<br>
+Average Net/Hour: €${(wh?net/wh:0).toFixed(2)}<br>
+Average Tip: €${(tips.length?tipsum/tips.length:0).toFixed(2)}`;
+let t="<tr><th>Date</th><th>Hours</th><th>Type</th></tr>";
+shifts.forEach(x=>t+=`<tr><td>${x.date}</td><td>${x.h.toFixed(2)}</td><td>Worked</td></tr>`);
+future.forEach(x=>t+=`<tr><td>${x.date}</td><td>${x.h.toFixed(2)}</td><td>Future</td></tr>`);
+tbl.innerHTML=t;
+}
+render();
+</script></body></html>
