@@ -10,12 +10,48 @@ import {
 const STORAGE_KEY = "wage-tracker-data-v1";
 
 const DEFAULT_SETTINGS = {
-  hourlyRate: 14.99,
+  // Rate history: list of { date, rate }. The rate that applies to a shift
+  // is the most recent entry whose date is on or before the shift's date.
+  rateHistory: [
+    { date: "2026-01-01", rate: 14.71 },
+    { date: "2026-07-01", rate: 14.99 },
+  ],
   vakantieurenPct: 10.64,
   vakantiegeldPct: 8,
-  pensionPct: 5.1,
+  pensionBasisPct: 55.91,
+  ouderdomspensioenPct: 8.4,
+  nabestaandenpensioenPct: 0.17,
+  wgaPct: 0.44,
+  premieHopPct: 0.1,
   monthlyGoal: 1000,
 };
+
+function getRateForDate(rateHistory, dateStr) {
+  const list = (rateHistory && rateHistory.length ? rateHistory : DEFAULT_SETTINGS.rateHistory)
+    .slice()
+    .sort((a, b) => a.date.localeCompare(b.date));
+  let applicable = list[0].rate;
+  for (const r of list) {
+    if (r.date <= dateStr) applicable = r.rate;
+    else break;
+  }
+  return applicable;
+}
+
+// Migrates old settings shape (single hourlyRate number) to rateHistory.
+function migrateSettings(raw) {
+  const merged = { ...DEFAULT_SETTINGS, ...(raw || {}) };
+  if (!merged.rateHistory || !merged.rateHistory.length) {
+    if (raw && typeof raw.hourlyRate === "number") {
+      merged.rateHistory = [{ date: "2020-01-01", rate: raw.hourlyRate }];
+    } else {
+      merged.rateHistory = DEFAULT_SETTINGS.rateHistory;
+    }
+  }
+  delete merged.hourlyRate;
+  delete merged.pensionPct;
+  return merged;
+}
 
 // ---------- helpers ----------
 function uid() {
@@ -39,11 +75,19 @@ function formatHM(hoursDecimal) {
   const m = totalMin % 60;
   return `${h}h${m.toString().padStart(2, "0")}m`;
 }
-function calcPay(hours, settings) {
-  const base = hours * settings.hourlyRate;
-  const gross = base * (1 + settings.vakantieurenPct / 100 + settings.vakantiegeldPct / 100);
-  const net = gross * (1 - settings.pensionPct / 100);
-  return { base, gross, net };
+function calcPay(hours, rate, settings) {
+  const base = hours * rate;
+  const vakantieurenAmt = base * (settings.vakantieurenPct / 100);
+  const vakantiegeldAmt = base * (settings.vakantiegeldPct / 100);
+  const gross = base + vakantieurenAmt + vakantiegeldAmt;
+
+  const pensionBasis = gross * (settings.pensionBasisPct / 100);
+  const deductionPctSum =
+    settings.ouderdomspensioenPct + settings.nabestaandenpensioenPct + settings.wgaPct + settings.premieHopPct;
+  const deductions = pensionBasis * (deductionPctSum / 100);
+
+  const net = gross - deductions;
+  return { base, vakantieurenAmt, vakantiegeldAmt, gross, pensionBasis, deductions, net };
 }
 function fmtEuro(n) {
   const v = Math.round((n || 0) * 100) / 100;
@@ -202,7 +246,7 @@ export default function App() {
         const res = await window.storage.get(STORAGE_KEY, false);
         if (res && res.value) {
           const parsed = JSON.parse(res.value);
-          setSettings({ ...DEFAULT_SETTINGS, ...(parsed.settings || {}) });
+          setSettings(migrateSettings(parsed.settings));
           setWorkDays(parsed.workDays || []);
           setTips(parsed.tips || []);
           setFutureShifts(parsed.futureShifts || []);
@@ -232,8 +276,9 @@ export default function App() {
 
   function addWorkDay(entry) {
     const hours = calcHoursDecimal(entry.date && entry.start, entry.end, entry.breakMin);
-    const { gross, net } = calcPay(hours, settings);
-    const row = { id: uid(), date: entry.date, start: entry.start, end: entry.end, breakMin: Number(entry.breakMin) || 0, hours, gross, net };
+    const rate = getRateForDate(settings.rateHistory, entry.date);
+    const { gross, net } = calcPay(hours, rate, settings);
+    const row = { id: uid(), date: entry.date, start: entry.start, end: entry.end, breakMin: Number(entry.breakMin) || 0, hours, rate, gross, net };
     const next = [...workDays, row].sort((a, b) => a.date.localeCompare(b.date));
     setWorkDays(next);
     persist({ workDays: next });
@@ -294,7 +339,10 @@ export default function App() {
     return { totalHours, gross, net, tipsSum, total: net + tipsSum };
   }, [monthWorkDays, monthTips]);
 
-  const avgIncomePerHour = summary.totalHours > 0 ? summary.total / summary.totalHours : calcPay(1, settings).net;
+  const avgIncomePerHour =
+    summary.totalHours > 0
+      ? summary.total / summary.totalHours
+      : calcPay(1, getRateForDate(settings.rateHistory, todayStr()), settings).net;
 
   if (!loaded) {
     return (
@@ -753,7 +801,7 @@ function StatsPage({ statsSub, setStatsSub, months, selectedMonth, setSelectedMo
           <Card>
             <p className="text-xs uppercase tracking-wide text-zinc-500 mb-2">Earnings per Hour</p>
             <div className="grid grid-cols-2 gap-3">
-              <StatBlock label="Hourly Wage" value={fmtEuro(settings.hourlyRate)} />
+              <StatBlock label="Hourly Wage" value={fmtEuro(getRateForDate(settings.rateHistory, selectedMonth + "-01"))} />
               <StatBlock label="Avg Net / Hour" value={fmtEuro(avgNetPerHour)} accent="text-emerald-400" />
               <StatBlock label="Avg Tip / Hour" value={fmtEuro(avgTipPerHour)} accent="text-amber-400" />
               <StatBlock label="Avg Income / Hour" value={fmtEuro(avgIncomePerHour)} />
@@ -909,7 +957,11 @@ function PredictionPage({ settings, summary, selectedMonth, futureShifts, onAdd,
   const [end, setEnd] = useState("22:00");
 
   const addedHours = futureShifts.reduce((s, f) => s + calcHoursDecimal(f.start, f.end, 0), 0);
-  const { gross: addedGross, net: addedNet } = calcPay(addedHours, settings);
+  const addedNet = futureShifts.reduce((s, f) => {
+    const h = calcHoursDecimal(f.start, f.end, 0);
+    const rate = getRateForDate(settings.rateHistory, f.date);
+    return s + calcPay(h, rate, settings).net;
+  }, 0);
   const tipRatePerHour = summary.totalHours > 0 ? summary.tipsSum / summary.totalHours : 0;
   const estimatedTips = tipRatePerHour * addedHours;
 
@@ -985,28 +1037,103 @@ function PredictionPage({ settings, summary, selectedMonth, futureShifts, onAdd,
 function SettingsPage({ settings, onSave }) {
   const [form, setForm] = useState(settings);
   const [saved, setSaved] = useState(false);
+  const [newRateDate, setNewRateDate] = useState(todayStr());
+  const [newRateValue, setNewRateValue] = useState("");
 
   function update(key, value) {
     setForm({ ...form, [key]: value });
     setSaved(false);
   }
 
+  const sortedRates = [...form.rateHistory].sort((a, b) => b.date.localeCompare(a.date));
+
+  function addRate() {
+    if (!newRateValue || !newRateDate) return;
+    const rest = form.rateHistory.filter((r) => r.date !== newRateDate);
+    const next = [...rest, { date: newRateDate, rate: Number(newRateValue) }];
+    update("rateHistory", next);
+    setNewRateValue("");
+  }
+  function removeRate(date) {
+    if (form.rateHistory.length <= 1) return; // always keep at least one
+    update("rateHistory", form.rateHistory.filter((r) => r.date !== date));
+  }
+
   return (
     <div>
       <Card className="mb-4">
+        <p className="text-sm font-medium text-zinc-200 mb-1">Pay Rates</p>
+        <p className="text-xs text-zinc-500 mb-3">
+          Add a new row whenever your hourly rate changes. Each shift uses whichever rate was
+          effective on its own date.
+        </p>
+
+        <div className="flex flex-col gap-2 mb-3">
+          {sortedRates.map((r) => (
+            <div key={r.date} className="flex items-center justify-between bg-zinc-800/60 rounded-xl px-3 py-2">
+              <div>
+                <p className="text-sm text-zinc-100 font-mono">{fmtEuro(r.rate)}/h</p>
+                <p className="text-[11px] text-zinc-500">from {r.date}</p>
+              </div>
+              <button onClick={() => removeRate(r.date)} disabled={form.rateHistory.length <= 1}>
+                <Trash2 size={15} className={form.rateHistory.length <= 1 ? "text-zinc-700" : "text-zinc-500"} />
+              </button>
+            </div>
+          ))}
+        </div>
+
+        <div className="grid grid-cols-2 gap-2 mb-2">
+          <Field label="Effective from">
+            <input type="date" value={newRateDate} onChange={(e) => setNewRateDate(e.target.value)} className={inputClass} />
+          </Field>
+          <Field label="New rate (€/h)">
+            <input
+              type="number"
+              step="0.01"
+              value={newRateValue}
+              onChange={(e) => setNewRateValue(e.target.value)}
+              placeholder="14.99"
+              className={inputClass}
+            />
+          </Field>
+        </div>
+        <button onClick={addRate} className="w-full flex items-center justify-center gap-2 bg-sky-400 text-zinc-950 font-medium rounded-xl py-2">
+          <Plus size={16} /> Add Rate Change
+        </button>
+      </Card>
+
+      <Card className="mb-4">
         <p className="text-sm font-medium text-zinc-200 mb-3">Pay Rules</p>
-        <Field label="Hourly rate (€/h)">
-          <input type="number" step="0.01" value={form.hourlyRate} onChange={(e) => update("hourlyRate", Number(e.target.value))} className={inputClass} />
-        </Field>
         <Field label="Vakantieuren (%)">
           <input type="number" step="0.01" value={form.vakantieurenPct} onChange={(e) => update("vakantieurenPct", Number(e.target.value))} className={inputClass} />
         </Field>
         <Field label="Vakantiegeld (%)">
           <input type="number" step="0.01" value={form.vakantiegeldPct} onChange={(e) => update("vakantiegeldPct", Number(e.target.value))} className={inputClass} />
         </Field>
-        <Field label="Pension deduction (%)">
-          <input type="number" step="0.01" value={form.pensionPct} onChange={(e) => update("pensionPct", Number(e.target.value))} className={inputClass} />
+      </Card>
+
+      <Card className="mb-4">
+        <p className="text-sm font-medium text-zinc-200 mb-1">Pension &amp; Deductions</p>
+        <p className="text-xs text-zinc-500 mb-3">
+          The four rates below are applied to the pension basis, not directly to gross pay.
+        </p>
+        <Field label="Pension basis (% of gross)">
+          <input type="number" step="0.01" value={form.pensionBasisPct} onChange={(e) => update("pensionBasisPct", Number(e.target.value))} className={inputClass} />
         </Field>
+        <div className="grid grid-cols-2 gap-2">
+          <Field label="Ouderdomspensioen (%)">
+            <input type="number" step="0.01" value={form.ouderdomspensioenPct} onChange={(e) => update("ouderdomspensioenPct", Number(e.target.value))} className={inputClass} />
+          </Field>
+          <Field label="Nabestaandenpensioen (%)">
+            <input type="number" step="0.01" value={form.nabestaandenpensioenPct} onChange={(e) => update("nabestaandenpensioenPct", Number(e.target.value))} className={inputClass} />
+          </Field>
+          <Field label="W.G.A. (%)">
+            <input type="number" step="0.01" value={form.wgaPct} onChange={(e) => update("wgaPct", Number(e.target.value))} className={inputClass} />
+          </Field>
+          <Field label="Premie HOP (%)">
+            <input type="number" step="0.01" value={form.premieHopPct} onChange={(e) => update("premieHopPct", Number(e.target.value))} className={inputClass} />
+          </Field>
+        </div>
       </Card>
 
       <Card className="mb-4">
@@ -1027,7 +1154,10 @@ function SettingsPage({ settings, onSave }) {
       </button>
 
       <p className="text-xs text-zinc-500 mt-4 leading-relaxed">
-        Net pay = hours × rate, plus vakantieuren and vakantiegeld reserves, minus the pension deduction. Tips are added on top and are never taxed or included in these calculations.
+        Gross pay = hours × the rate effective on that date, plus vakantieuren and vakantiegeld
+        (both calculated on the base wage). The pension basis is a percentage of that gross, and
+        Ouderdomspensioen, Nabestaandenpensioen, W.G.A. and Premie HOP are each deducted from that
+        basis. Tips are added on top and are never taxed or included in these calculations.
       </p>
     </div>
   );
@@ -1041,7 +1171,8 @@ function AddWorkModal({ settings, onClose, onSave }) {
   const [breakMin, setBreakMin] = useState(0);
 
   const hours = calcHoursDecimal(start, end, breakMin);
-  const { gross, net } = calcPay(hours, settings);
+  const rate = getRateForDate(settings.rateHistory, date);
+  const { gross, net } = calcPay(hours, rate, settings);
 
   return (
     <Modal title="Add Work Day" onClose={onClose}>
@@ -1074,6 +1205,7 @@ function AddWorkModal({ settings, onClose, onSave }) {
           <p className="font-mono text-sm text-emerald-400">{fmtEuro(net)}</p>
         </div>
       </div>
+      <p className="text-[11px] text-zinc-500 -mt-2 mb-3">Using rate {fmtEuro(rate)}/h for this date.</p>
 
       <button
         onClick={() => onSave({ date, start, end, breakMin })}
