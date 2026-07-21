@@ -24,7 +24,85 @@ const DEFAULT_SETTINGS = {
   wgaPct: 0.44,
   premieHopPct: 0.1,
   monthlyGoal: 1000,
+
+  // Dutch income tax (loonheffing) estimate, calibrated to 2026 rules.
+  incomeTaxEnabled: true,
+  incomeTaxRatePct: 35.75, // combined box-1 rate, first bracket
+  gtcMaxAnnual: 3115, // algemene heffingskorting, max
+  gtcPhaseoutThresholdAnnual: 29736,
+  gtcPhaseoutRatePct: 6.398,
+  akRate1Pct: 8.3902, // arbeidskorting build-up, segment 1
+  akThreshold1Annual: 12022,
+  akRate2Pct: 31.433, // arbeidskorting build-up, segment 2
+  akThreshold2Annual: 26895, // where it reaches the max
+  akMaxAnnual: 5685,
+  akAfbouwThresholdAnnual: 45592,
+  akAfbouwRatePct: 6.51,
+
+  // Vakantiegeld/vakantieuren are "bijzondere beloningen" (special payments)
+  // and are taxed at a separate flat rate based on last year's wage, not
+  // through the same progressive monthly table as regular wages.
+  specialBeloningenRatePct: 4.74,
 };
+
+// Splits a set of shifts into the "regular wage" portion (taxed via the
+// normal progressive monthly table) and the "special payments" portion
+// (vakantieuren + vakantiegeld, taxed at a flat rate) — both after the
+// pension deduction has been applied proportionally.
+function splitTaxComponents(days, settings) {
+  let baseSum = 0;
+  let grossSum = 0;
+  let netSum = 0;
+  const specialFraction = (settings.vakantieurenPct + settings.vakantiegeldPct) / 100;
+  days.forEach((d) => {
+    const rate = d.rate ?? (d.hours ? d.gross / (1 + specialFraction) / d.hours : 0);
+    baseSum += (d.hours || 0) * rate;
+    grossSum += d.gross || 0;
+    netSum += d.net || 0;
+  });
+  const specialGross = Math.max(0, grossSum - baseSum);
+  const reduction = grossSum > 0 ? netSum / grossSum : 1;
+  return { regularNet: baseSum * reduction, specialNet: specialGross * reduction };
+}
+
+function calcRegularIncomeTax(monthlyRegularIncome, settings) {
+  if (monthlyRegularIncome <= 0) return 0;
+  const annual = monthlyRegularIncome * 12;
+
+  // Arbeidskorting (labour tax credit): build-up in two segments, a plateau
+  // at the max, then a phase-out at higher incomes.
+  let ltc;
+  if (annual <= settings.akThreshold1Annual) {
+    ltc = annual * (settings.akRate1Pct / 100);
+  } else if (annual <= settings.akThreshold2Annual) {
+    ltc =
+      settings.akThreshold1Annual * (settings.akRate1Pct / 100) +
+      (annual - settings.akThreshold1Annual) * (settings.akRate2Pct / 100);
+  } else if (annual <= settings.akAfbouwThresholdAnnual) {
+    ltc = settings.akMaxAnnual;
+  } else {
+    ltc = Math.max(0, settings.akMaxAnnual - (annual - settings.akAfbouwThresholdAnnual) * (settings.akAfbouwRatePct / 100));
+  }
+
+  // Algemene heffingskorting (general tax credit): flat, then phases out.
+  let gtc = settings.gtcMaxAnnual;
+  if (annual > settings.gtcPhaseoutThresholdAnnual) {
+    gtc = Math.max(0, settings.gtcMaxAnnual - (annual - settings.gtcPhaseoutThresholdAnnual) * (settings.gtcPhaseoutRatePct / 100));
+  }
+
+  const taxAnnual = Math.max(0, annual * (settings.incomeTaxRatePct / 100) - gtc - ltc);
+  return taxAnnual / 12;
+}
+
+// Computes total monthly income tax for a set of shifts (real, hypothetical,
+// or a mix), correctly splitting regular wage from special payments.
+function calcMonthlyIncomeTax(days, settings) {
+  if (!settings.incomeTaxEnabled) return { regularTax: 0, specialTax: 0, total: 0 };
+  const { regularNet, specialNet } = splitTaxComponents(days, settings);
+  const regularTax = calcRegularIncomeTax(regularNet, settings);
+  const specialTax = Math.max(0, specialNet) * (settings.specialBeloningenRatePct / 100);
+  return { regularTax, specialTax, total: regularTax + specialTax };
+}
 
 function getRateForDate(rateHistory, dateStr) {
   const list = (rateHistory && rateHistory.length ? rateHistory : DEFAULT_SETTINGS.rateHistory)
@@ -334,10 +412,12 @@ export default function App() {
   const summary = useMemo(() => {
     const totalHours = monthWorkDays.reduce((s, d) => s + d.hours, 0);
     const gross = monthWorkDays.reduce((s, d) => s + d.gross, 0);
-    const net = monthWorkDays.reduce((s, d) => s + d.net, 0);
+    const net = monthWorkDays.reduce((s, d) => s + d.net, 0); // after pension, before income tax
     const tipsSum = monthTips.reduce((s, t) => s + t.amount, 0);
-    return { totalHours, gross, net, tipsSum, total: net + tipsSum };
-  }, [monthWorkDays, monthTips]);
+    const incomeTax = calcMonthlyIncomeTax(monthWorkDays, settings).total;
+    const netAfterTax = net - incomeTax;
+    return { totalHours, gross, net, incomeTax, netAfterTax, tipsSum, total: netAfterTax + tipsSum };
+  }, [monthWorkDays, monthTips, settings]);
 
   const avgIncomePerHour =
     summary.totalHours > 0
@@ -418,6 +498,7 @@ export default function App() {
           <PredictionPage
             settings={settings}
             summary={summary}
+            monthWorkDays={monthWorkDays}
             selectedMonth={selectedMonth}
             futureShifts={futureShifts}
             onAdd={addFutureShift}
@@ -535,7 +616,9 @@ function Dashboard({
       <div className="grid grid-cols-2 gap-3 mb-4">
         <Card><StatBlock label="Worked Hours" value={formatHM(summary.totalHours)} /></Card>
         <Card><StatBlock label="Gross Salary" value={fmtEuro(summary.gross)} accent="text-sky-400" /></Card>
-        <Card><StatBlock label="Net Salary" value={fmtEuro(summary.net)} accent="text-emerald-400" /></Card>
+        <Card><StatBlock label="Net (before tax)" value={fmtEuro(summary.net)} accent="text-emerald-400" /></Card>
+        <Card><StatBlock label="Income Tax" value={"-" + fmtEuro(summary.incomeTax)} accent="text-red-400" /></Card>
+        <Card><StatBlock label="Net after Tax" value={fmtEuro(summary.netAfterTax)} accent="text-emerald-400" /></Card>
         <Card><StatBlock label="Tips" value={fmtEuro(summary.tipsSum)} accent="text-amber-400" /></Card>
       </div>
 
@@ -678,14 +761,16 @@ function StatsPage({ statsSub, setStatsSub, months, selectedMonth, setSelectedMo
   const gross = monthWorkDays.reduce((s, d) => s + d.gross, 0);
   const net = monthWorkDays.reduce((s, d) => s + d.net, 0);
   const tipsSum = monthTips.reduce((s, t) => s + t.amount, 0);
-  const total = net + tipsSum;
+  const incomeTax = calcMonthlyIncomeTax(monthWorkDays, settings).total;
+  const netAfterTax = net - incomeTax;
+  const total = netAfterTax + tipsSum;
 
   const workedDaysCount = new Set(monthWorkDays.map((d) => d.date)).size;
   const avgHoursPerShift = monthWorkDays.length ? totalHours / monthWorkDays.length : 0;
   const weeksInMonth = Math.max(1, monthDays(selectedMonth) / 7);
   const avgHoursPerWeek = totalHours / weeksInMonth;
 
-  const avgNetPerHour = totalHours ? net / totalHours : 0;
+  const avgNetPerHour = totalHours ? netAfterTax / totalHours : 0;
   const avgTipPerHour = totalHours ? tipsSum / totalHours : 0;
   const avgIncomePerHour = avgNetPerHour + avgTipPerHour;
 
@@ -749,7 +834,11 @@ function StatsPage({ statsSub, setStatsSub, months, selectedMonth, setSelectedMo
   const yearOf = selectedMonth.slice(0, 4);
   const yearMonths = allMonths.filter((m) => m.startsWith(yearOf));
   const yearHours = workDays.filter((w) => yearMonths.includes(monthKey(w.date))).reduce((s, w) => s + w.hours, 0);
-  const yearNet = workDays.filter((w) => yearMonths.includes(monthKey(w.date))).reduce((s, w) => s + w.net, 0);
+  const yearNet = yearMonths.reduce((s, m) => {
+    const mDays = workDays.filter((w) => monthKey(w.date) === m);
+    const mn = mDays.reduce((sum, w) => sum + w.net, 0);
+    return s + (mn - calcMonthlyIncomeTax(mDays, settings).total);
+  }, 0);
   const yearTips = tips.filter((t) => yearMonths.includes(monthKey(t.date))).reduce((s, t) => s + t.amount, 0);
 
   const subTabs = [
@@ -781,8 +870,10 @@ function StatsPage({ statsSub, setStatsSub, months, selectedMonth, setSelectedMo
           <Card>
             <p className="text-xs uppercase tracking-wide text-zinc-500 mb-2">Salary Overview</p>
             <div className="grid grid-cols-2 gap-3">
-              <StatBlock label="Net Salary" value={fmtEuro(net)} accent="text-emerald-400" />
               <StatBlock label="Gross Salary" value={fmtEuro(gross)} accent="text-sky-400" />
+              <StatBlock label="Net (before tax)" value={fmtEuro(net)} accent="text-emerald-400" />
+              <StatBlock label="Income Tax" value={"-" + fmtEuro(incomeTax)} accent="text-red-400" />
+              <StatBlock label="Net after Tax" value={fmtEuro(netAfterTax)} accent="text-emerald-400" />
               <StatBlock label="Tips" value={fmtEuro(tipsSum)} accent="text-amber-400" />
               <StatBlock label="Total Income" value={fmtEuro(total)} />
             </div>
@@ -923,14 +1014,17 @@ function StatsPage({ statsSub, setStatsSub, months, selectedMonth, setSelectedMo
         <div className="flex flex-col gap-2">
           {allMonths.length === 0 && <p className="text-sm text-zinc-500 text-center mt-6">No history yet.</p>}
           {allMonths.slice().reverse().map((m) => {
-            const mh = workDays.filter((w) => monthKey(w.date) === m).reduce((s, w) => s + w.hours, 0);
-            const mn = workDays.filter((w) => monthKey(w.date) === m).reduce((s, w) => s + w.net, 0);
+            const mDays = workDays.filter((w) => monthKey(w.date) === m);
+            const mh = mDays.reduce((s, w) => s + w.hours, 0);
+            const mn = mDays.reduce((s, w) => s + w.net, 0);
+            const mTax = calcMonthlyIncomeTax(mDays, settings).total;
+            const mnAfterTax = mn - mTax;
             return (
               <Card key={m} className="flex items-center justify-between">
                 <span className="text-sm font-medium text-zinc-200">{monthLabel(m)}</span>
                 <div className="flex gap-4 text-right">
                   <StatBlock label="Hours" value={formatHM(mh)} />
-                  <StatBlock label="Net" value={fmtEuro(mn)} accent="text-emerald-400" />
+                  <StatBlock label="Net" value={fmtEuro(mnAfterTax)} accent="text-emerald-400" />
                 </div>
               </Card>
             );
@@ -951,22 +1045,26 @@ function StatsPage({ statsSub, setStatsSub, months, selectedMonth, setSelectedMo
 }
 
 // ---------- Prediction ----------
-function PredictionPage({ settings, summary, selectedMonth, futureShifts, onAdd, onRemove, avgIncomePerHour }) {
+function PredictionPage({ settings, summary, monthWorkDays, selectedMonth, futureShifts, onAdd, onRemove, avgIncomePerHour }) {
   const [date, setDate] = useState(todayStr());
   const [start, setStart] = useState("17:00");
   const [end, setEnd] = useState("22:00");
 
-  const addedHours = futureShifts.reduce((s, f) => s + calcHoursDecimal(f.start, f.end, 0), 0);
-  const addedNet = futureShifts.reduce((s, f) => {
+  const futureAsDays = futureShifts.map((f) => {
     const h = calcHoursDecimal(f.start, f.end, 0);
     const rate = getRateForDate(settings.rateHistory, f.date);
-    return s + calcPay(h, rate, settings).net;
-  }, 0);
+    const { gross, net } = calcPay(h, rate, settings);
+    return { hours: h, rate, gross, net };
+  });
+  const addedHours = futureAsDays.reduce((s, d) => s + d.hours, 0);
+  const addedNet = futureAsDays.reduce((s, d) => s + d.net, 0);
   const tipRatePerHour = summary.totalHours > 0 ? summary.tipsSum / summary.totalHours : 0;
   const estimatedTips = tipRatePerHour * addedHours;
 
   const projHours = summary.totalHours + addedHours;
-  const projNet = summary.net + addedNet;
+  const projNetBeforeTax = summary.net + addedNet;
+  const projIncomeTax = calcMonthlyIncomeTax([...monthWorkDays, ...futureAsDays], settings).total;
+  const projNet = projNetBeforeTax - projIncomeTax;
   const projTips = summary.tipsSum + estimatedTips;
   const projTotal = projNet + projTips;
 
@@ -975,7 +1073,7 @@ function PredictionPage({ settings, summary, selectedMonth, futureShifts, onAdd,
       <Card className="mb-4">
         <p className="text-xs uppercase tracking-wide text-zinc-500 mb-2">Current — {monthLabel(selectedMonth)}</p>
         <div className="grid grid-cols-2 gap-3">
-          <StatBlock label="Net" value={fmtEuro(summary.net)} accent="text-emerald-400" />
+          <StatBlock label="Net after Tax" value={fmtEuro(summary.netAfterTax)} accent="text-emerald-400" />
           <StatBlock label="Hours" value={summary.totalHours.toFixed(2)} />
         </div>
       </Card>
@@ -1021,7 +1119,8 @@ function PredictionPage({ settings, summary, selectedMonth, futureShifts, onAdd,
         <p className="text-xs uppercase tracking-wide text-zinc-500 mb-2">End of {monthLabel(selectedMonth).split(" ")[0]}, Projected</p>
         <div className="grid grid-cols-2 gap-3">
           <StatBlock label="Hours" value={projHours.toFixed(1)} />
-          <StatBlock label="Net Salary" value={fmtEuro(projNet)} accent="text-emerald-400" />
+          <StatBlock label="Income Tax" value={"-" + fmtEuro(projIncomeTax)} accent="text-red-400" />
+          <StatBlock label="Net after Tax" value={fmtEuro(projNet)} accent="text-emerald-400" />
           <StatBlock label="Tips (estimated)" value={fmtEuro(projTips)} accent="text-amber-400" />
           <StatBlock label="Total" value={fmtEuro(projTotal)} />
         </div>
@@ -1137,6 +1236,74 @@ function SettingsPage({ settings, onSave }) {
       </Card>
 
       <Card className="mb-4">
+        <div className="flex items-center justify-between mb-1">
+          <p className="text-sm font-medium text-zinc-200">Income Tax (NL 2026 estimate)</p>
+          <button
+            onClick={() => update("incomeTaxEnabled", !form.incomeTaxEnabled)}
+            className={`px-3 py-1 rounded-full text-xs font-medium ${
+              form.incomeTaxEnabled ? "bg-emerald-400 text-zinc-950" : "bg-zinc-800 text-zinc-400"
+            }`}
+          >
+            {form.incomeTaxEnabled ? "On" : "Off"}
+          </button>
+        </div>
+        <p className="text-xs text-zinc-500 mb-3">
+          Applied once per month to your total net-before-tax pay (not per shift), matching how
+          Dutch payroll withholding actually works.
+        </p>
+        {form.incomeTaxEnabled && (
+          <>
+            <Field label="Combined tax rate (%)">
+              <input type="number" step="0.01" value={form.incomeTaxRatePct} onChange={(e) => update("incomeTaxRatePct", Number(e.target.value))} className={inputClass} />
+            </Field>
+            <Field label="Vakantiegeld/vakantieuren tax rate (%)">
+              <input type="number" step="0.01" value={form.specialBeloningenRatePct} onChange={(e) => update("specialBeloningenRatePct", Number(e.target.value))} className={inputClass} />
+            </Field>
+            <p className="text-[11px] text-zinc-500 -mt-2 mb-3">
+              Dutch payroll taxes vakantiegeld/vakantieuren ("bijzondere beloningen") at this flat
+              rate instead of the regular progressive table.
+            </p>
+            <p className="text-xs text-zinc-500 mb-1 mt-1">Algemene heffingskorting</p>
+            <div className="grid grid-cols-2 gap-2 mb-2">
+              <Field label="Max (€/yr)">
+                <input type="number" step="1" value={form.gtcMaxAnnual} onChange={(e) => update("gtcMaxAnnual", Number(e.target.value))} className={inputClass} />
+              </Field>
+              <Field label="Phase-out from (€/yr)">
+                <input type="number" step="1" value={form.gtcPhaseoutThresholdAnnual} onChange={(e) => update("gtcPhaseoutThresholdAnnual", Number(e.target.value))} className={inputClass} />
+              </Field>
+              <Field label="Phase-out rate (%)">
+                <input type="number" step="0.01" value={form.gtcPhaseoutRatePct} onChange={(e) => update("gtcPhaseoutRatePct", Number(e.target.value))} className={inputClass} />
+              </Field>
+            </div>
+            <p className="text-xs text-zinc-500 mb-1">Arbeidskorting</p>
+            <div className="grid grid-cols-2 gap-2">
+              <Field label="Rate 1 (%)">
+                <input type="number" step="0.0001" value={form.akRate1Pct} onChange={(e) => update("akRate1Pct", Number(e.target.value))} className={inputClass} />
+              </Field>
+              <Field label="Threshold 1 (€/yr)">
+                <input type="number" step="1" value={form.akThreshold1Annual} onChange={(e) => update("akThreshold1Annual", Number(e.target.value))} className={inputClass} />
+              </Field>
+              <Field label="Rate 2 (%)">
+                <input type="number" step="0.001" value={form.akRate2Pct} onChange={(e) => update("akRate2Pct", Number(e.target.value))} className={inputClass} />
+              </Field>
+              <Field label="Threshold 2 (€/yr)">
+                <input type="number" step="1" value={form.akThreshold2Annual} onChange={(e) => update("akThreshold2Annual", Number(e.target.value))} className={inputClass} />
+              </Field>
+              <Field label="Max (€/yr)">
+                <input type="number" step="1" value={form.akMaxAnnual} onChange={(e) => update("akMaxAnnual", Number(e.target.value))} className={inputClass} />
+              </Field>
+              <Field label="Phase-out from (€/yr)">
+                <input type="number" step="1" value={form.akAfbouwThresholdAnnual} onChange={(e) => update("akAfbouwThresholdAnnual", Number(e.target.value))} className={inputClass} />
+              </Field>
+              <Field label="Phase-out rate (%)">
+                <input type="number" step="0.01" value={form.akAfbouwRatePct} onChange={(e) => update("akAfbouwRatePct", Number(e.target.value))} className={inputClass} />
+              </Field>
+            </div>
+          </>
+        )}
+      </Card>
+
+      <Card className="mb-4">
         <p className="text-sm font-medium text-zinc-200 mb-3">Goal</p>
         <Field label="Monthly goal (€)">
           <input type="number" step="1" value={form.monthlyGoal} onChange={(e) => update("monthlyGoal", Number(e.target.value))} className={inputClass} />
@@ -1157,7 +1324,8 @@ function SettingsPage({ settings, onSave }) {
         Gross pay = hours × the rate effective on that date, plus vakantieuren and vakantiegeld
         (both calculated on the base wage). The pension basis is a percentage of that gross, and
         Ouderdomspensioen, Nabestaandenpensioen, W.G.A. and Premie HOP are each deducted from that
-        basis. Tips are added on top and are never taxed or included in these calculations.
+        basis. Income tax (loonheffing) is then estimated once per month on the resulting net pay.
+        Tips are added on top of everything and are never taxed.
       </p>
     </div>
   );
