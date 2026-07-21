@@ -43,6 +43,10 @@ const DEFAULT_SETTINGS = {
   // and are taxed at a separate flat rate based on last year's wage, not
   // through the same progressive monthly table as regular wages.
   specialBeloningenRatePct: 4.74,
+
+  // Below this total monthly (pre-tax, post-pension) income, no income tax
+  // is withheld at all — regardless of the regular/special split.
+  taxFreeThresholdMonthly: 946,
 };
 
 // Splits a set of shifts into the "regular wage" portion (taxed via the
@@ -99,6 +103,10 @@ function calcRegularIncomeTax(monthlyRegularIncome, settings) {
 function calcMonthlyIncomeTax(days, settings) {
   if (!settings.incomeTaxEnabled) return { regularTax: 0, specialTax: 0, total: 0 };
   const { regularNet, specialNet } = splitTaxComponents(days, settings);
+  const totalNet = regularNet + specialNet;
+  if (totalNet <= settings.taxFreeThresholdMonthly) {
+    return { regularTax: 0, specialTax: 0, total: 0 };
+  }
   const regularTax = calcRegularIncomeTax(regularNet, settings);
   const specialTax = Math.max(0, specialNet) * (settings.specialBeloningenRatePct / 100);
   return { regularTax, specialTax, total: regularTax + specialTax };
@@ -1253,6 +1261,12 @@ function SettingsPage({ settings, onSave }) {
         </p>
         {form.incomeTaxEnabled && (
           <>
+            <Field label="Tax-free threshold (€/month)">
+              <input type="number" step="1" value={form.taxFreeThresholdMonthly} onChange={(e) => update("taxFreeThresholdMonthly", Number(e.target.value))} className={inputClass} />
+            </Field>
+            <p className="text-[11px] text-zinc-500 -mt-2 mb-3">
+              Below this total monthly income, no tax is withheld at all.
+            </p>
             <Field label="Combined tax rate (%)">
               <input type="number" step="0.01" value={form.incomeTaxRatePct} onChange={(e) => update("incomeTaxRatePct", Number(e.target.value))} className={inputClass} />
             </Field>
