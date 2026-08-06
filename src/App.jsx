@@ -4,7 +4,7 @@ import {
   Plus, X, Trash2, ChevronLeft, ChevronRight, Target, CalendarDays, Flame,
 } from "lucide-react";
 import {
-  BarChart, Bar, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
+  BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
 } from "recharts";
 
 const STORAGE_KEY = "wage-tracker-data-v1";
@@ -24,93 +24,7 @@ const DEFAULT_SETTINGS = {
   wgaPct: 0.44,
   premieHopPct: 0.1,
   monthlyGoal: 1000,
-
-  // Dutch income tax (loonheffing) estimate, calibrated to 2026 rules.
-  incomeTaxEnabled: true,
-  incomeTaxRatePct: 35.75, // combined box-1 rate, first bracket
-  gtcMaxAnnual: 3115, // algemene heffingskorting, max
-  gtcPhaseoutThresholdAnnual: 29736,
-  gtcPhaseoutRatePct: 6.398,
-  akRate1Pct: 8.3902, // arbeidskorting build-up, segment 1
-  akThreshold1Annual: 12022,
-  akRate2Pct: 31.433, // arbeidskorting build-up, segment 2
-  akThreshold2Annual: 26895, // where it reaches the max
-  akMaxAnnual: 5685,
-  akAfbouwThresholdAnnual: 45592,
-  akAfbouwRatePct: 6.51,
-
-  // Vakantiegeld/vakantieuren are "bijzondere beloningen" (special payments)
-  // and are taxed at a separate flat rate based on last year's wage, not
-  // through the same progressive monthly table as regular wages.
-  specialBeloningenRatePct: 4.74,
-
-  // Below this total monthly (pre-tax, post-pension) income, no income tax
-  // is withheld at all — regardless of the regular/special split.
-  taxFreeThresholdMonthly: 946,
 };
-
-// Splits a set of shifts into the "regular wage" portion (taxed via the
-// normal progressive monthly table) and the "special payments" portion
-// (vakantieuren + vakantiegeld, taxed at a flat rate) — both after the
-// pension deduction has been applied proportionally.
-function splitTaxComponents(days, settings) {
-  let baseSum = 0;
-  let grossSum = 0;
-  let netSum = 0;
-  const specialFraction = (settings.vakantieurenPct + settings.vakantiegeldPct) / 100;
-  days.forEach((d) => {
-    const rate = d.rate ?? (d.hours ? d.gross / (1 + specialFraction) / d.hours : 0);
-    baseSum += (d.hours || 0) * rate;
-    grossSum += d.gross || 0;
-    netSum += d.net || 0;
-  });
-  const specialGross = Math.max(0, grossSum - baseSum);
-  const reduction = grossSum > 0 ? netSum / grossSum : 1;
-  return { regularNet: baseSum * reduction, specialNet: specialGross * reduction };
-}
-
-function calcRegularIncomeTax(monthlyRegularIncome, settings) {
-  if (monthlyRegularIncome <= 0) return 0;
-  const annual = monthlyRegularIncome * 12;
-
-  // Arbeidskorting (labour tax credit): build-up in two segments, a plateau
-  // at the max, then a phase-out at higher incomes.
-  let ltc;
-  if (annual <= settings.akThreshold1Annual) {
-    ltc = annual * (settings.akRate1Pct / 100);
-  } else if (annual <= settings.akThreshold2Annual) {
-    ltc =
-      settings.akThreshold1Annual * (settings.akRate1Pct / 100) +
-      (annual - settings.akThreshold1Annual) * (settings.akRate2Pct / 100);
-  } else if (annual <= settings.akAfbouwThresholdAnnual) {
-    ltc = settings.akMaxAnnual;
-  } else {
-    ltc = Math.max(0, settings.akMaxAnnual - (annual - settings.akAfbouwThresholdAnnual) * (settings.akAfbouwRatePct / 100));
-  }
-
-  // Algemene heffingskorting (general tax credit): flat, then phases out.
-  let gtc = settings.gtcMaxAnnual;
-  if (annual > settings.gtcPhaseoutThresholdAnnual) {
-    gtc = Math.max(0, settings.gtcMaxAnnual - (annual - settings.gtcPhaseoutThresholdAnnual) * (settings.gtcPhaseoutRatePct / 100));
-  }
-
-  const taxAnnual = Math.max(0, annual * (settings.incomeTaxRatePct / 100) - gtc - ltc);
-  return taxAnnual / 12;
-}
-
-// Computes total monthly income tax for a set of shifts (real, hypothetical,
-// or a mix), correctly splitting regular wage from special payments.
-function calcMonthlyIncomeTax(days, settings) {
-  if (!settings.incomeTaxEnabled) return { regularTax: 0, specialTax: 0, total: 0 };
-  const { regularNet, specialNet } = splitTaxComponents(days, settings);
-  const totalNet = regularNet + specialNet;
-  if (totalNet <= settings.taxFreeThresholdMonthly) {
-    return { regularTax: 0, specialTax: 0, total: 0 };
-  }
-  const regularTax = calcRegularIncomeTax(regularNet, settings);
-  const specialTax = Math.max(0, specialNet) * (settings.specialBeloningenRatePct / 100);
-  return { regularTax, specialTax, total: regularTax + specialTax };
-}
 
 function getRateForDate(rateHistory, dateStr) {
   const list = (rateHistory && rateHistory.length ? rateHistory : DEFAULT_SETTINGS.rateHistory)
@@ -209,6 +123,43 @@ function monthDays(key) {
 function monthFirstWeekday(key) {
   const [y, m] = key.split("-").map(Number);
   return (new Date(y, m - 1, 1).getDay() + 6) % 7; // 0=Mon
+}
+
+// Tips are paid out 3x per month: days 1-10, 11-20, and 21-end.
+const TIP_PERIODS = [1, 2, 3];
+function periodRangeLabel(month, period) {
+  if (period === 1) return "1–10";
+  if (period === 2) return "11–20";
+  return `21–${monthDays(month)}`;
+}
+function periodForDay(day) {
+  if (day <= 10) return 1;
+  if (day <= 20) return 2;
+  return 3;
+}
+// Migrates old {id, date, amount} tip entries into the new
+// {id, month, period, amount} shape, summing anything that lands in the
+// same period.
+function migrateTips(rawTips) {
+  const buckets = {};
+  (rawTips || []).forEach((t) => {
+    let month, period;
+    if (t.month && t.period) {
+      month = t.month;
+      period = t.period;
+    } else if (t.date) {
+      month = monthKey(t.date);
+      period = periodForDay(Number(t.date.slice(8, 10)));
+    } else {
+      return;
+    }
+    const key = `${month}|${period}`;
+    buckets[key] = (buckets[key] || 0) + (Number(t.amount) || 0);
+  });
+  return Object.entries(buckets).map(([key, amount]) => {
+    const [month, period] = key.split("|");
+    return { id: key, month, period: Number(period), amount };
+  });
 }
 
 // ---------- small UI atoms ----------
@@ -320,10 +271,10 @@ export default function App() {
   const [workDays, setWorkDays] = useState([]);
   const [tips, setTips] = useState([]);
   const [futureShifts, setFutureShifts] = useState([]);
+  const [manualNetSalaries, setManualNetSalaries] = useState({}); // { "2026-07": 1234.56, ... } - final net after all taxes
   const [tab, setTab] = useState("dashboard");
   const [showAddWork, setShowAddWork] = useState(false);
-  const [showAddTip, setShowAddTip] = useState(false);
-  const [statsSub, setStatsSub] = useState("overview");
+  const [statsSub, setStatsSub] = useState("calendar");
   const [saveError, setSaveError] = useState(false);
 
   useEffect(() => {
@@ -334,8 +285,22 @@ export default function App() {
           const parsed = JSON.parse(res.value);
           setSettings(migrateSettings(parsed.settings));
           setWorkDays(parsed.workDays || []);
-          setTips(parsed.tips || []);
+          setTips(migrateTips(parsed.tips));
           setFutureShifts(parsed.futureShifts || []);
+          // Support both old (manualTaxes) and new (manualNetSalaries) formats
+          if (parsed.manualNetSalaries) {
+            setManualNetSalaries(parsed.manualNetSalaries);
+          } else if (parsed.manualTaxes) {
+            // Migrate old format: convert from "tax deducted" to "final net salary"
+            const migrated = {};
+            Object.entries(parsed.manualTaxes).forEach(([month, tax]) => {
+              // Find the month's automatic net and subtract the old tax
+              const monthWork = (parsed.workDays || []).filter(w => monthKey(w.date) === month);
+              const autoNet = monthWork.reduce((s, d) => s + d.net, 0);
+              migrated[month] = autoNet - tax;
+            });
+            setManualNetSalaries(migrated);
+          }
         }
       } catch (e) {
         // no existing data yet
@@ -351,6 +316,7 @@ export default function App() {
         workDays: next.workDays ?? workDays,
         tips: next.tips ?? tips,
         futureShifts: next.futureShifts ?? futureShifts,
+        manualNetSalaries: next.manualNetSalaries ?? manualNetSalaries,
       };
       const result = await window.storage.set(STORAGE_KEY, JSON.stringify(payload), false);
       if (!result) setSaveError(true);
@@ -374,14 +340,14 @@ export default function App() {
     setWorkDays(next);
     persist({ workDays: next });
   }
-  function addTip(entry) {
-    const row = { id: uid(), date: entry.date, amount: Number(entry.amount) || 0 };
-    const next = [...tips, row].sort((a, b) => a.date.localeCompare(b.date));
-    setTips(next);
-    persist({ tips: next });
-  }
-  function deleteTip(id) {
-    const next = tips.filter((t) => t.id !== id);
+  function upsertTip(month, period, amountStr) {
+    const id = `${month}|${period}`;
+    const amount = Number(amountStr);
+    const withoutThis = tips.filter((t) => t.id !== id);
+    const next =
+      amountStr === "" || isNaN(amount) || amount === 0
+        ? withoutThis
+        : [...withoutThis, { id, month, period, amount }];
     setTips(next);
     persist({ tips: next });
   }
@@ -400,12 +366,17 @@ export default function App() {
     setFutureShifts(next);
     persist({ futureShifts: next });
   }
+  function setManualNetForMonth(month, value) {
+    const next = { ...manualNetSalaries, [month]: value === "" ? undefined : Number(value) };
+    setManualNetSalaries(next);
+    persist({ manualNetSalaries: next });
+  }
 
   // months present in data (+ current month always included)
   const months = useMemo(() => {
     const set = new Set([todayStr().slice(0, 7)]);
     workDays.forEach((w) => set.add(monthKey(w.date)));
-    tips.forEach((t) => set.add(monthKey(t.date)));
+    tips.forEach((t) => set.add(t.month));
     return Array.from(set).sort();
   }, [workDays, tips]);
 
@@ -415,17 +386,18 @@ export default function App() {
   }, [months]); // eslint-disable-line
 
   const monthWorkDays = useMemo(() => workDays.filter((w) => monthKey(w.date) === selectedMonth), [workDays, selectedMonth]);
-  const monthTips = useMemo(() => tips.filter((t) => monthKey(t.date) === selectedMonth), [tips, selectedMonth]);
+  const monthTips = useMemo(() => tips.filter((t) => t.month === selectedMonth), [tips, selectedMonth]);
 
   const summary = useMemo(() => {
     const totalHours = monthWorkDays.reduce((s, d) => s + d.hours, 0);
     const gross = monthWorkDays.reduce((s, d) => s + d.gross, 0);
-    const net = monthWorkDays.reduce((s, d) => s + d.net, 0); // after pension, before income tax
+    const net = monthWorkDays.reduce((s, d) => s + d.net, 0); // after pension, before additional tax
     const tipsSum = monthTips.reduce((s, t) => s + t.amount, 0);
-    const incomeTax = calcMonthlyIncomeTax(monthWorkDays, settings).total;
-    const netAfterTax = net - incomeTax;
-    return { totalHours, gross, net, incomeTax, netAfterTax, tipsSum, total: netAfterTax + tipsSum };
-  }, [monthWorkDays, monthTips, settings]);
+    const manualNetSalary = manualNetSalaries[selectedMonth]; // This is the FINAL net after all taxes
+    const hasManualEntry = typeof manualNetSalary === "number";
+    const netFinal = hasManualEntry ? manualNetSalary : net;
+    return { totalHours, gross, net, manualNetSalary, hasManualEntry, netFinal, tipsSum, total: netFinal + tipsSum };
+  }, [monthWorkDays, monthTips, manualNetSalaries, selectedMonth]);
 
   const avgIncomePerHour =
     summary.totalHours > 0
@@ -461,9 +433,9 @@ export default function App() {
             monthTips={monthTips}
             avgIncomePerHour={avgIncomePerHour}
             onAddWork={() => setShowAddWork(true)}
-            onAddTip={() => setShowAddTip(true)}
+            onGoToTips={() => setTab("tips")}
             onDeleteWork={deleteWorkDay}
-            onDeleteTip={deleteTip}
+            onSetManualNet={(val) => setManualNetForMonth(selectedMonth, val)}
           />
         )}
 
@@ -473,7 +445,6 @@ export default function App() {
             selectedMonth={selectedMonth}
             setSelectedMonth={setSelectedMonth}
             monthWorkDays={monthWorkDays}
-            onAdd={() => setShowAddWork(true)}
             onDelete={deleteWorkDay}
           />
         )}
@@ -484,8 +455,7 @@ export default function App() {
             selectedMonth={selectedMonth}
             setSelectedMonth={setSelectedMonth}
             monthTips={monthTips}
-            onAdd={() => setShowAddTip(true)}
-            onDelete={deleteTip}
+            onUpsert={upsertTip}
           />
         )}
 
@@ -499,6 +469,7 @@ export default function App() {
             workDays={workDays}
             tips={tips}
             settings={settings}
+            manualNetSalaries={manualNetSalaries}
           />
         )}
 
@@ -527,15 +498,6 @@ export default function App() {
           onSave={(entry) => {
             addWorkDay(entry);
             setShowAddWork(false);
-          }}
-        />
-      )}
-      {showAddTip && (
-        <AddTipModal
-          onClose={() => setShowAddTip(false)}
-          onSave={(entry) => {
-            addTip(entry);
-            setShowAddTip(false);
           }}
         />
       )}
@@ -593,18 +555,21 @@ function BottomNav({ tab, setTab }) {
 // ---------- Dashboard ----------
 function Dashboard({
   months, selectedMonth, setSelectedMonth, summary, settings,
-  monthWorkDays, monthTips, avgIncomePerHour, onAddWork, onAddTip, onDeleteWork, onDeleteTip,
+  monthWorkDays, monthTips, avgIncomePerHour, onAddWork, onGoToTips, onDeleteWork, onSetManualNet,
 }) {
   const goal = settings.monthlyGoal;
   const pct = goal > 0 ? summary.total / goal : 0;
   const remaining = Math.max(goal - summary.total, 0);
   const hoursNeeded = avgIncomePerHour > 0 ? remaining / avgIncomePerHour : 0;
 
+  const [netInput, setNetInput] = useState(summary.manualNetSalary ? String(summary.manualNetSalary) : "");
+  useEffect(() => {
+    setNetInput(summary.manualNetSalary ? String(summary.manualNetSalary) : "");
+  }, [selectedMonth]); // eslint-disable-line
+
   const recent = useMemo(() => {
-    const workRows = monthWorkDays.map((w) => ({ type: "work", ...w }));
-    const tipRows = monthTips.map((t) => ({ type: "tip", ...t }));
-    return [...workRows, ...tipRows].sort((a, b) => b.date.localeCompare(a.date)).slice(0, 6);
-  }, [monthWorkDays, monthTips]);
+    return [...monthWorkDays].sort((a, b) => b.date.localeCompare(a.date)).slice(0, 6);
+  }, [monthWorkDays]);
 
   return (
     <div>
@@ -624,11 +589,34 @@ function Dashboard({
       <div className="grid grid-cols-2 gap-3 mb-4">
         <Card><StatBlock label="Worked Hours" value={formatHM(summary.totalHours)} /></Card>
         <Card><StatBlock label="Gross Salary" value={fmtEuro(summary.gross)} accent="text-sky-400" /></Card>
-        <Card><StatBlock label="Net (before tax)" value={fmtEuro(summary.net)} accent="text-emerald-400" /></Card>
-        <Card><StatBlock label="Income Tax" value={"-" + fmtEuro(summary.incomeTax)} accent="text-red-400" /></Card>
-        <Card><StatBlock label="Net after Tax" value={fmtEuro(summary.netAfterTax)} accent="text-emerald-400" /></Card>
+        <Card><StatBlock label="Net" value={fmtEuro(summary.net)} accent="text-emerald-400" /></Card>
         <Card><StatBlock label="Tips" value={fmtEuro(summary.tipsSum)} accent="text-amber-400" /></Card>
       </div>
+
+      <Card className="mb-4">
+        <span className="text-xs uppercase tracking-wide text-zinc-500">Net Salary (after all taxes)</span>
+        <div className="flex items-center gap-2 mt-1">
+          <span className="text-zinc-500">€</span>
+          <input
+            type="number"
+            step="0.01"
+            placeholder={fmtEuro(summary.net)}
+            value={netInput}
+            onChange={(e) => {
+              setNetInput(e.target.value);
+              onSetManualNet(e.target.value);
+            }}
+            className="w-full bg-transparent text-lg font-mono tabular-nums text-emerald-400 focus:outline-none"
+          />
+        </div>
+        <p className="text-xs text-zinc-500 mt-1">
+          {summary.hasManualEntry ? (
+            <>Manually entered: {fmtEuro(summary.netFinal)}</>
+          ) : (
+            <>Auto-calculated from work log: {fmtEuro(summary.net)}</>
+          )}
+        </p>
+      </Card>
 
       <Card className="mb-4">
         <div className="flex items-center gap-2 mb-2">
@@ -657,23 +645,19 @@ function Dashboard({
           <Plus size={18} /> Work Day
         </button>
         <button
-          onClick={onAddTip}
+          onClick={onGoToTips}
           className="flex items-center justify-center gap-2 bg-amber-400 text-zinc-950 font-medium rounded-2xl py-3"
         >
-          <Coins size={18} /> Add Tip
+          <Coins size={18} /> Tips
         </button>
       </div>
 
       <h3 className="text-sm font-semibold text-zinc-300 mb-2">Recent</h3>
       <div className="flex flex-col gap-2">
         {recent.length === 0 && <p className="text-sm text-zinc-500">Nothing logged yet this month.</p>}
-        {recent.map((r) =>
-          r.type === "work" ? (
-            <WorkRow key={r.id} row={r} onDelete={onDeleteWork} />
-          ) : (
-            <TipRow key={r.id} row={r} onDelete={onDeleteTip} />
-          )
-        )}
+        {recent.map((r) => (
+          <WorkRow key={r.id} row={r} onDelete={onDeleteWork} />
+        ))}
       </div>
     </div>
   );
@@ -695,38 +679,63 @@ function WorkRow({ row, onDelete }) {
     </Card>
   );
 }
-function TipRow({ row, onDelete }) {
-  return (
-    <Card className="flex items-center justify-between">
-      <div>
-        <p className="text-sm font-medium text-zinc-100">{shiftDayLabel(row.date)}</p>
-        <p className="text-xs text-amber-400">Tip</p>
-      </div>
-      <div className="flex items-center gap-3">
-        <span className="font-mono text-amber-400 text-sm tabular-nums">+{fmtEuro(row.amount)}</span>
-        <button onClick={() => onDelete(row.id)}>
-          <Trash2 size={15} className="text-zinc-600" />
-        </button>
-      </div>
-    </Card>
-  );
-}
 
 // ---------- Work Log ----------
-function WorkLog({ months, selectedMonth, setSelectedMonth, monthWorkDays, onAdd, onDelete }) {
+function WorkLog({ months, selectedMonth, setSelectedMonth, monthWorkDays, onDelete }) {
   const sorted = [...monthWorkDays].sort((a, b) => b.date.localeCompare(a.date));
+  const monthDaysCount = monthDays(selectedMonth);
+  const firstDay = `${selectedMonth}-01`;
+  const lastDay = `${selectedMonth}-${String(monthDaysCount).padStart(2, "0")}`;
+  
+  const [startDate, setStartDate] = useState(firstDay);
+  const [endDate, setEndDate] = useState(lastDay);
+  
+  const filtered = sorted.filter((w) => w.date >= startDate && w.date <= endDate);
+  const totalHours = filtered.reduce((s, d) => s + d.hours, 0);
+  const workedDays = new Set(filtered.map((d) => d.date)).size;
+  
   return (
     <div>
       <MonthNav months={months} selected={selectedMonth} onChange={setSelectedMonth} />
-      <button
-        onClick={onAdd}
-        className="w-full flex items-center justify-center gap-2 bg-emerald-400 text-zinc-950 font-medium rounded-2xl py-3 mb-4"
-      >
-        <Plus size={18} /> Add Work Day
-      </button>
+      
+      <Card className="mb-4">
+        <p className="text-xs uppercase tracking-wide text-zinc-500 mb-3">Select Date Range</p>
+        <div className="grid grid-cols-2 gap-2 mb-3">
+          <Field label="Start Date">
+            <input 
+              type="date" 
+              value={startDate} 
+              onChange={(e) => setStartDate(e.target.value)}
+              min={firstDay}
+              max={lastDay}
+              className={inputClass}
+            />
+          </Field>
+          <Field label="End Date">
+            <input 
+              type="date" 
+              value={endDate} 
+              onChange={(e) => setEndDate(e.target.value)}
+              min={firstDay}
+              max={lastDay}
+              className={inputClass}
+            />
+          </Field>
+        </div>
+        
+        <div className="grid grid-cols-2 gap-3">
+          <Card>
+            <StatBlock label="Total Hours" value={formatHM(totalHours)} accent="text-emerald-400" />
+          </Card>
+          <Card>
+            <StatBlock label="Worked Days" value={String(workedDays)} accent="text-sky-400" />
+          </Card>
+        </div>
+      </Card>
+      
       <div className="flex flex-col gap-2">
-        {sorted.length === 0 && <p className="text-sm text-zinc-500 text-center mt-6">No shifts logged this month.</p>}
-        {sorted.map((r) => (
+        {filtered.length === 0 && <p className="text-sm text-zinc-500 text-center mt-6">No shifts in this date range.</p>}
+        {filtered.map((r) => (
           <WorkRow key={r.id} row={r} onDelete={onDelete} />
         ))}
       </div>
@@ -735,8 +744,7 @@ function WorkLog({ months, selectedMonth, setSelectedMonth, monthWorkDays, onAdd
 }
 
 // ---------- Tips ----------
-function TipsPage({ months, selectedMonth, setSelectedMonth, monthTips, onAdd, onDelete }) {
-  const sorted = [...monthTips].sort((a, b) => b.date.localeCompare(a.date));
+function TipsPage({ months, selectedMonth, setSelectedMonth, monthTips, onUpsert }) {
   const total = monthTips.reduce((s, t) => s + t.amount, 0);
   return (
     <div>
@@ -744,41 +752,72 @@ function TipsPage({ months, selectedMonth, setSelectedMonth, monthTips, onAdd, o
       <Card className="mb-4">
         <StatBlock label="Tips this month" value={fmtEuro(total)} accent="text-amber-400" />
       </Card>
-      <button
-        onClick={onAdd}
-        className="w-full flex items-center justify-center gap-2 bg-amber-400 text-zinc-950 font-medium rounded-2xl py-3 mb-4"
-      >
-        <Coins size={18} /> Add Tip
-      </button>
-      <div className="flex flex-col gap-2">
-        {sorted.length === 0 && <p className="text-sm text-zinc-500 text-center mt-6">No tips logged this month.</p>}
-        {sorted.map((r) => (
-          <TipRow key={r.id} row={r} onDelete={onDelete} />
+      <p className="text-xs text-zinc-500 mb-3">Tips are paid out 3 times a month — enter each as you receive it.</p>
+      <div className="flex flex-col gap-3">
+        {TIP_PERIODS.map((period) => (
+          <TipPeriodCard
+            key={period}
+            month={selectedMonth}
+            period={period}
+            amount={monthTips.find((t) => t.period === period)?.amount ?? ""}
+            onUpsert={onUpsert}
+          />
         ))}
       </div>
     </div>
   );
 }
 
+function TipPeriodCard({ month, period, amount, onUpsert }) {
+  const [value, setValue] = useState(amount === "" ? "" : String(amount));
+  useEffect(() => {
+    setValue(amount === "" ? "" : String(amount));
+  }, [month]); // eslint-disable-line
+
+  return (
+    <Card>
+      <div className="flex items-center justify-between mb-1">
+        <span className="text-sm font-medium text-zinc-200">Days {periodRangeLabel(month, period)}</span>
+        <Coins size={15} className="text-amber-400" />
+      </div>
+      <div className="flex items-center gap-2 mt-1">
+        <span className="text-zinc-500">€</span>
+        <input
+          type="number"
+          step="0.01"
+          placeholder="0.00"
+          value={value}
+          onChange={(e) => {
+            setValue(e.target.value);
+            onUpsert(month, period, e.target.value);
+          }}
+          className="w-full bg-transparent text-lg font-mono tabular-nums text-amber-400 focus:outline-none"
+        />
+      </div>
+    </Card>
+  );
+}
+
 // ---------- Stats ----------
-function StatsPage({ statsSub, setStatsSub, months, selectedMonth, setSelectedMonth, workDays, tips, settings }) {
+function StatsPage({ statsSub, setStatsSub, months, selectedMonth, setSelectedMonth, workDays, tips, settings, manualNetSalaries }) {
   const monthWorkDays = workDays.filter((w) => monthKey(w.date) === selectedMonth);
-  const monthTips = tips.filter((t) => monthKey(t.date) === selectedMonth);
+  const monthTips = tips.filter((t) => t.month === selectedMonth);
 
   const totalHours = monthWorkDays.reduce((s, d) => s + d.hours, 0);
   const gross = monthWorkDays.reduce((s, d) => s + d.gross, 0);
   const net = monthWorkDays.reduce((s, d) => s + d.net, 0);
   const tipsSum = monthTips.reduce((s, t) => s + t.amount, 0);
-  const incomeTax = calcMonthlyIncomeTax(monthWorkDays, settings).total;
-  const netAfterTax = net - incomeTax;
-  const total = netAfterTax + tipsSum;
+  const manualNetSalary = manualNetSalaries[selectedMonth];
+  const hasManualEntry = typeof manualNetSalary === "number";
+  const netFinal = hasManualEntry ? manualNetSalary : net;
+  const total = netFinal + tipsSum;
 
   const workedDaysCount = new Set(monthWorkDays.map((d) => d.date)).size;
   const avgHoursPerShift = monthWorkDays.length ? totalHours / monthWorkDays.length : 0;
   const weeksInMonth = Math.max(1, monthDays(selectedMonth) / 7);
   const avgHoursPerWeek = totalHours / weeksInMonth;
 
-  const avgNetPerHour = totalHours ? netAfterTax / totalHours : 0;
+  const avgNetPerHour = totalHours ? netFinal / totalHours : 0;
   const avgTipPerHour = totalHours ? tipsSum / totalHours : 0;
   const avgIncomePerHour = avgNetPerHour + avgTipPerHour;
 
@@ -789,7 +828,7 @@ function StatsPage({ statsSub, setStatsSub, months, selectedMonth, setSelectedMo
   const shortestDay = monthWorkDays.find((d) => d.hours === shortest);
 
   const highestTip = monthTips.length ? Math.max(...monthTips.map((t) => t.amount)) : 0;
-  const avgTipPerShift = monthTips.length ? tipsSum / monthTips.length : 0;
+  const avgTipPerPeriod = monthTips.length ? tipsSum / monthTips.length : 0;
 
   const goal = settings.monthlyGoal;
   const pct = goal > 0 ? total / goal : 0;
@@ -801,23 +840,16 @@ function StatsPage({ statsSub, setStatsSub, months, selectedMonth, setSelectedMo
     const h = monthWorkDays.filter((d) => weekdayIdx(d.date) === idx).reduce((s, d) => s + d.hours, 0);
     return { day: label, hours: Math.round(h * 100) / 100 };
   });
-  const incomeByWeek = useMemo(() => {
-    const buckets = {};
-    monthWorkDays.forEach((d) => {
-      const day = Number(d.date.slice(8, 10));
-      const w = Math.floor((day - 1) / 7) + 1;
-      buckets[w] = (buckets[w] || 0) + d.net;
-    });
-    monthTips.forEach((t) => {
-      const day = Number(t.date.slice(8, 10));
-      const w = Math.floor((day - 1) / 7) + 1;
-      buckets[w] = (buckets[w] || 0) + t.amount;
-    });
-    return Object.keys(buckets).sort().map((w) => ({ week: `Week ${w}`, income: Math.round(buckets[w] * 100) / 100 }));
-  }, [monthWorkDays, monthTips]);
-  const tipTrend = [...monthTips].sort((a, b) => a.date.localeCompare(b.date)).map((t) => ({
-    date: shiftDayLabel(t.date),
-    tip: t.amount,
+  const incomeByPeriod = TIP_PERIODS.map((period) => {
+    const workNet = monthWorkDays
+      .filter((d) => periodForDay(Number(d.date.slice(8, 10))) === period)
+      .reduce((s, d) => s + d.net, 0);
+    const tipAmt = monthTips.find((t) => t.period === period)?.amount || 0;
+    return { period: periodRangeLabel(selectedMonth, period), income: Math.round((workNet + tipAmt) * 100) / 100 };
+  });
+  const tipTrend = TIP_PERIODS.map((period) => ({
+    period: periodRangeLabel(selectedMonth, period),
+    tip: monthTips.find((t) => t.period === period)?.amount || 0,
   }));
 
   // calendar
@@ -838,16 +870,17 @@ function StatsPage({ statsSub, setStatsSub, months, selectedMonth, setSelectedMo
   }
 
   // history: all months
-  const allMonths = Array.from(new Set([...workDays.map((w) => monthKey(w.date)), ...tips.map((t) => monthKey(t.date))])).sort();
+  const allMonths = Array.from(new Set([...workDays.map((w) => monthKey(w.date)), ...tips.map((t) => t.month)])).sort();
   const yearOf = selectedMonth.slice(0, 4);
   const yearMonths = allMonths.filter((m) => m.startsWith(yearOf));
   const yearHours = workDays.filter((w) => yearMonths.includes(monthKey(w.date))).reduce((s, w) => s + w.hours, 0);
   const yearNet = yearMonths.reduce((s, m) => {
-    const mDays = workDays.filter((w) => monthKey(w.date) === m);
-    const mn = mDays.reduce((sum, w) => sum + w.net, 0);
-    return s + (mn - calcMonthlyIncomeTax(mDays, settings).total);
+    const mn = workDays.filter((w) => monthKey(w.date) === m).reduce((sum, w) => sum + w.net, 0);
+    const manualNet = manualNetSalaries[m];
+    const netForMonth = typeof manualNet === "number" ? manualNet : mn;
+    return s + netForMonth;
   }, 0);
-  const yearTips = tips.filter((t) => yearMonths.includes(monthKey(t.date))).reduce((s, t) => s + t.amount, 0);
+  const yearTips = tips.filter((t) => yearMonths.includes(t.month)).reduce((s, t) => s + t.amount, 0);
 
   const subTabs = [
     { id: "overview", label: "Overview" },
@@ -879,9 +912,8 @@ function StatsPage({ statsSub, setStatsSub, months, selectedMonth, setSelectedMo
             <p className="text-xs uppercase tracking-wide text-zinc-500 mb-2">Salary Overview</p>
             <div className="grid grid-cols-2 gap-3">
               <StatBlock label="Gross Salary" value={fmtEuro(gross)} accent="text-sky-400" />
-              <StatBlock label="Net (before tax)" value={fmtEuro(net)} accent="text-emerald-400" />
-              <StatBlock label="Income Tax" value={"-" + fmtEuro(incomeTax)} accent="text-red-400" />
-              <StatBlock label="Net after Tax" value={fmtEuro(netAfterTax)} accent="text-emerald-400" />
+              <StatBlock label="Net (auto)" value={fmtEuro(net)} accent="text-emerald-400" sub="after pension" />
+              <StatBlock label={hasManualEntry ? "Net (manual)" : "Net (final)"} value={fmtEuro(netFinal)} accent="text-emerald-400" sub={hasManualEntry ? "after all taxes" : undefined} />
               <StatBlock label="Tips" value={fmtEuro(tipsSum)} accent="text-amber-400" />
               <StatBlock label="Total Income" value={fmtEuro(total)} />
             </div>
@@ -922,7 +954,7 @@ function StatsPage({ statsSub, setStatsSub, months, selectedMonth, setSelectedMo
             <div className="grid grid-cols-2 gap-3">
               <StatBlock label="Total Tips" value={fmtEuro(tipsSum)} accent="text-amber-400" />
               <StatBlock label="Highest Tip" value={fmtEuro(highestTip)} accent="text-amber-400" />
-              <StatBlock label="Avg / Shift" value={fmtEuro(avgTipPerShift)} />
+              <StatBlock label="Avg / Period" value={fmtEuro(avgTipPerPeriod)} />
               <StatBlock label="Avg / Hour" value={fmtEuro(avgTipPerHour)} />
             </div>
           </Card>
@@ -988,32 +1020,16 @@ function StatsPage({ statsSub, setStatsSub, months, selectedMonth, setSelectedMo
             </ResponsiveContainer>
           </Card>
           <Card>
-            <p className="text-xs uppercase tracking-wide text-zinc-500 mb-2">Income by Week</p>
+            <p className="text-xs uppercase tracking-wide text-zinc-500 mb-2">Income by Pay Period</p>
             <ResponsiveContainer width="100%" height={180}>
-              <BarChart data={incomeByWeek}>
+              <BarChart data={incomeByPeriod}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#27272a" vertical={false} />
-                <XAxis dataKey="week" tick={{ fill: "#71717a", fontSize: 11 }} axisLine={false} tickLine={false} />
+                <XAxis dataKey="period" tick={{ fill: "#71717a", fontSize: 11 }} axisLine={false} tickLine={false} />
                 <YAxis tick={{ fill: "#71717a", fontSize: 11 }} axisLine={false} tickLine={false} />
                 <Tooltip contentStyle={{ background: "#18181b", border: "1px solid #3f3f46", borderRadius: 8 }} labelStyle={{ color: "#e4e4e7" }} />
                 <Bar dataKey="income" fill="#38bdf8" radius={[6, 6, 0, 0]} />
               </BarChart>
             </ResponsiveContainer>
-          </Card>
-          <Card>
-            <p className="text-xs uppercase tracking-wide text-zinc-500 mb-2">Tip Trend</p>
-            {tipTrend.length ? (
-              <ResponsiveContainer width="100%" height={180}>
-                <LineChart data={tipTrend}>
-                  <CartesianGrid strokeDasharray="3 3" stroke="#27272a" vertical={false} />
-                  <XAxis dataKey="date" tick={{ fill: "#71717a", fontSize: 11 }} axisLine={false} tickLine={false} />
-                  <YAxis tick={{ fill: "#71717a", fontSize: 11 }} axisLine={false} tickLine={false} />
-                  <Tooltip contentStyle={{ background: "#18181b", border: "1px solid #3f3f46", borderRadius: 8 }} labelStyle={{ color: "#e4e4e7" }} />
-                  <Line type="monotone" dataKey="tip" stroke="#fbbf24" strokeWidth={2} dot={{ r: 3, fill: "#fbbf24" }} />
-                </LineChart>
-              </ResponsiveContainer>
-            ) : (
-              <p className="text-sm text-zinc-500">No tips logged this month.</p>
-            )}
           </Card>
         </div>
       )}
@@ -1025,7 +1041,7 @@ function StatsPage({ statsSub, setStatsSub, months, selectedMonth, setSelectedMo
             const mDays = workDays.filter((w) => monthKey(w.date) === m);
             const mh = mDays.reduce((s, w) => s + w.hours, 0);
             const mn = mDays.reduce((s, w) => s + w.net, 0);
-            const mTax = calcMonthlyIncomeTax(mDays, settings).total;
+            const mTax = manualTaxes[m] || 0;
             const mnAfterTax = mn - mTax;
             return (
               <Card key={m} className="flex items-center justify-between">
@@ -1070,18 +1086,16 @@ function PredictionPage({ settings, summary, monthWorkDays, selectedMonth, futur
   const estimatedTips = tipRatePerHour * addedHours;
 
   const projHours = summary.totalHours + addedHours;
-  const projNetBeforeTax = summary.net + addedNet;
-  const projIncomeTax = calcMonthlyIncomeTax([...monthWorkDays, ...futureAsDays], settings).total;
-  const projNet = projNetBeforeTax - projIncomeTax;
+  const projNet = summary.net + addedNet; // before tax — tax isn't predicted, enter it once you know it
   const projTips = summary.tipsSum + estimatedTips;
-  const projTotal = projNet + projTips;
+  const projTotal = projNet - summary.manualTax + projTips; // only the tax you've already entered is applied
 
   return (
     <div>
       <Card className="mb-4">
         <p className="text-xs uppercase tracking-wide text-zinc-500 mb-2">Current — {monthLabel(selectedMonth)}</p>
         <div className="grid grid-cols-2 gap-3">
-          <StatBlock label="Net after Tax" value={fmtEuro(summary.netAfterTax)} accent="text-emerald-400" />
+          <StatBlock label="Net (after your tax)" value={fmtEuro(summary.netFinal)} accent="text-emerald-400" />
           <StatBlock label="Hours" value={summary.totalHours.toFixed(2)} />
         </div>
       </Card>
@@ -1127,13 +1141,13 @@ function PredictionPage({ settings, summary, monthWorkDays, selectedMonth, futur
         <p className="text-xs uppercase tracking-wide text-zinc-500 mb-2">End of {monthLabel(selectedMonth).split(" ")[0]}, Projected</p>
         <div className="grid grid-cols-2 gap-3">
           <StatBlock label="Hours" value={projHours.toFixed(1)} />
-          <StatBlock label="Income Tax" value={"-" + fmtEuro(projIncomeTax)} accent="text-red-400" />
-          <StatBlock label="Net after Tax" value={fmtEuro(projNet)} accent="text-emerald-400" />
+          <StatBlock label="Net (before tax)" value={fmtEuro(projNet)} accent="text-emerald-400" />
           <StatBlock label="Tips (estimated)" value={fmtEuro(projTips)} accent="text-amber-400" />
-          <StatBlock label="Total" value={fmtEuro(projTotal)} />
+          <StatBlock label="Total so far" value={fmtEuro(projTotal)} />
         </div>
         <p className="text-xs text-zinc-500 mt-2">
           Tips are estimated from your average tip rate of {fmtEuro(tipRatePerHour)}/hour so far this month.
+          This projection uses your manually entered net salary from the Dashboard (if any) or auto-calculates from work hours.
         </p>
       </Card>
     </div>
@@ -1244,80 +1258,6 @@ function SettingsPage({ settings, onSave }) {
       </Card>
 
       <Card className="mb-4">
-        <div className="flex items-center justify-between mb-1">
-          <p className="text-sm font-medium text-zinc-200">Income Tax (NL 2026 estimate)</p>
-          <button
-            onClick={() => update("incomeTaxEnabled", !form.incomeTaxEnabled)}
-            className={`px-3 py-1 rounded-full text-xs font-medium ${
-              form.incomeTaxEnabled ? "bg-emerald-400 text-zinc-950" : "bg-zinc-800 text-zinc-400"
-            }`}
-          >
-            {form.incomeTaxEnabled ? "On" : "Off"}
-          </button>
-        </div>
-        <p className="text-xs text-zinc-500 mb-3">
-          Applied once per month to your total net-before-tax pay (not per shift), matching how
-          Dutch payroll withholding actually works.
-        </p>
-        {form.incomeTaxEnabled && (
-          <>
-            <Field label="Tax-free threshold (€/month)">
-              <input type="number" step="1" value={form.taxFreeThresholdMonthly} onChange={(e) => update("taxFreeThresholdMonthly", Number(e.target.value))} className={inputClass} />
-            </Field>
-            <p className="text-[11px] text-zinc-500 -mt-2 mb-3">
-              Below this total monthly income, no tax is withheld at all.
-            </p>
-            <Field label="Combined tax rate (%)">
-              <input type="number" step="0.01" value={form.incomeTaxRatePct} onChange={(e) => update("incomeTaxRatePct", Number(e.target.value))} className={inputClass} />
-            </Field>
-            <Field label="Vakantiegeld/vakantieuren tax rate (%)">
-              <input type="number" step="0.01" value={form.specialBeloningenRatePct} onChange={(e) => update("specialBeloningenRatePct", Number(e.target.value))} className={inputClass} />
-            </Field>
-            <p className="text-[11px] text-zinc-500 -mt-2 mb-3">
-              Dutch payroll taxes vakantiegeld/vakantieuren ("bijzondere beloningen") at this flat
-              rate instead of the regular progressive table.
-            </p>
-            <p className="text-xs text-zinc-500 mb-1 mt-1">Algemene heffingskorting</p>
-            <div className="grid grid-cols-2 gap-2 mb-2">
-              <Field label="Max (€/yr)">
-                <input type="number" step="1" value={form.gtcMaxAnnual} onChange={(e) => update("gtcMaxAnnual", Number(e.target.value))} className={inputClass} />
-              </Field>
-              <Field label="Phase-out from (€/yr)">
-                <input type="number" step="1" value={form.gtcPhaseoutThresholdAnnual} onChange={(e) => update("gtcPhaseoutThresholdAnnual", Number(e.target.value))} className={inputClass} />
-              </Field>
-              <Field label="Phase-out rate (%)">
-                <input type="number" step="0.01" value={form.gtcPhaseoutRatePct} onChange={(e) => update("gtcPhaseoutRatePct", Number(e.target.value))} className={inputClass} />
-              </Field>
-            </div>
-            <p className="text-xs text-zinc-500 mb-1">Arbeidskorting</p>
-            <div className="grid grid-cols-2 gap-2">
-              <Field label="Rate 1 (%)">
-                <input type="number" step="0.0001" value={form.akRate1Pct} onChange={(e) => update("akRate1Pct", Number(e.target.value))} className={inputClass} />
-              </Field>
-              <Field label="Threshold 1 (€/yr)">
-                <input type="number" step="1" value={form.akThreshold1Annual} onChange={(e) => update("akThreshold1Annual", Number(e.target.value))} className={inputClass} />
-              </Field>
-              <Field label="Rate 2 (%)">
-                <input type="number" step="0.001" value={form.akRate2Pct} onChange={(e) => update("akRate2Pct", Number(e.target.value))} className={inputClass} />
-              </Field>
-              <Field label="Threshold 2 (€/yr)">
-                <input type="number" step="1" value={form.akThreshold2Annual} onChange={(e) => update("akThreshold2Annual", Number(e.target.value))} className={inputClass} />
-              </Field>
-              <Field label="Max (€/yr)">
-                <input type="number" step="1" value={form.akMaxAnnual} onChange={(e) => update("akMaxAnnual", Number(e.target.value))} className={inputClass} />
-              </Field>
-              <Field label="Phase-out from (€/yr)">
-                <input type="number" step="1" value={form.akAfbouwThresholdAnnual} onChange={(e) => update("akAfbouwThresholdAnnual", Number(e.target.value))} className={inputClass} />
-              </Field>
-              <Field label="Phase-out rate (%)">
-                <input type="number" step="0.01" value={form.akAfbouwRatePct} onChange={(e) => update("akAfbouwRatePct", Number(e.target.value))} className={inputClass} />
-              </Field>
-            </div>
-          </>
-        )}
-      </Card>
-
-      <Card className="mb-4">
         <p className="text-sm font-medium text-zinc-200 mb-3">Goal</p>
         <Field label="Monthly goal (€)">
           <input type="number" step="1" value={form.monthlyGoal} onChange={(e) => update("monthlyGoal", Number(e.target.value))} className={inputClass} />
@@ -1338,8 +1278,8 @@ function SettingsPage({ settings, onSave }) {
         Gross pay = hours × the rate effective on that date, plus vakantieuren and vakantiegeld
         (both calculated on the base wage). The pension basis is a percentage of that gross, and
         Ouderdomspensioen, Nabestaandenpensioen, W.G.A. and Premie HOP are each deducted from that
-        basis. Income tax (loonheffing) is then estimated once per month on the resulting net pay.
-        Tips are added on top of everything and are never taxed.
+        basis. Income tax isn't calculated automatically — enter your own on the Dashboard once
+        you've worked it out. Tips are added on top of everything and are never taxed.
       </p>
     </div>
   );
@@ -1392,29 +1332,6 @@ function AddWorkModal({ settings, onClose, onSave }) {
       <button
         onClick={() => onSave({ date, start, end, breakMin })}
         className="w-full bg-emerald-400 text-zinc-950 font-medium rounded-xl py-2.5"
-      >
-        Save
-      </button>
-    </Modal>
-  );
-}
-
-function AddTipModal({ onClose, onSave }) {
-  const [date, setDate] = useState(todayStr());
-  const [amount, setAmount] = useState("");
-
-  return (
-    <Modal title="Add Tip" onClose={onClose}>
-      <Field label="Date">
-        <input type="date" value={date} onChange={(e) => setDate(e.target.value)} className={inputClass} />
-      </Field>
-      <Field label="Amount (€)">
-        <input type="number" step="0.01" value={amount} onChange={(e) => setAmount(e.target.value)} className={inputClass} placeholder="0.00" />
-      </Field>
-      <button
-        onClick={() => onSave({ date, amount })}
-        disabled={!amount}
-        className="w-full bg-amber-400 text-zinc-950 font-medium rounded-xl py-2.5 disabled:opacity-40"
       >
         Save
       </button>
