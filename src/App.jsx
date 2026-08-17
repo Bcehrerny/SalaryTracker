@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useMemo } from "react";
 import {
   Home, Clock, Coins, BarChart3, TrendingUp, Settings as SettingsIcon,
-  Plus, X, Trash2, ChevronLeft, ChevronRight, Target, CalendarDays, Flame,
+  Plus, X, Trash2, ChevronLeft, ChevronRight, Target, CalendarDays, Flame, Pencil,
 } from "lucide-react";
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
@@ -125,13 +125,40 @@ function monthFirstWeekday(key) {
   return (new Date(y, m - 1, 1).getDay() + 6) % 7; // 0=Mon
 }
 
-// Tips are paid out 3x per month: days 1-10, 11-20, and 21-end.
+// Tips are paid out 3x per month. Defaults to days 1-10, 11-20, and 21-end,
+// but each range is editable per month (payouts aren't always exactly every
+// 10 days).
 const TIP_PERIODS = [1, 2, 3];
-function periodRangeLabel(month, period) {
-  if (period === 1) return "1–10";
-  if (period === 2) return "11–20";
-  return `21–${monthDays(month)}`;
+function defaultTipRanges(month) {
+  return [
+    { start: 1, end: 10 },
+    { start: 11, end: 20 },
+    { start: 21, end: monthDays(month) },
+  ];
 }
+// Looks up the (possibly customized) ranges for a month, falling back to the
+// default 1-10/11-20/21-end split.
+function getTipRanges(tipPeriodRanges, month) {
+  const custom = tipPeriodRanges && tipPeriodRanges[month];
+  if (custom && custom.length === 3) return custom;
+  return defaultTipRanges(month);
+}
+function tipRangeLabel(ranges, period) {
+  const r = ranges[period - 1];
+  return `${r.start}–${r.end}`;
+}
+// Finds which period (1/2/3) a given day-of-month falls into, given a set
+// of ranges. Falls back to the nearest period if the day is outside all of
+// them (e.g. ranges were edited to leave a gap).
+function periodForDayInRanges(day, ranges) {
+  for (let i = 0; i < ranges.length; i++) {
+    if (day >= ranges[i].start && day <= ranges[i].end) return i + 1;
+  }
+  if (day < ranges[0].start) return 1;
+  return ranges.length;
+}
+// Fixed 1-10/11-20/21-end split, used only for one-time migration of legacy
+// date-based tip entries (see migrateTips below).
 function periodForDay(day) {
   if (day <= 10) return 1;
   if (day <= 20) return 2;
@@ -237,9 +264,9 @@ function MonthNav({ months, selected, onChange }) {
 }
 function Modal({ title, onClose, children }) {
   return (
-    <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/60" onClick={onClose}>
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4" onClick={onClose}>
       <div
-        className="bg-zinc-900 border border-zinc-800 rounded-t-3xl sm:rounded-3xl w-full sm:w-96 p-5 pb-8"
+        className="bg-zinc-900 border border-zinc-800 rounded-3xl w-full sm:w-96 p-5 max-h-[85vh] overflow-y-auto"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between mb-4">
@@ -272,8 +299,12 @@ export default function App() {
   const [tips, setTips] = useState([]);
   const [futureShifts, setFutureShifts] = useState([]);
   const [manualNetSalaries, setManualNetSalaries] = useState({}); // { "2026-07": 1234.56, ... } - final net after all taxes
+  const [tipPeriodRanges, setTipPeriodRanges] = useState({}); // { "2026-07": [{start,end} x3], ... }
   const [tab, setTab] = useState("dashboard");
   const [showAddWork, setShowAddWork] = useState(false);
+  const [editingWorkDay, setEditingWorkDay] = useState(null); // work day row being edited, or null
+  const [confirmDeleteId, setConfirmDeleteId] = useState(null); // work day id pending delete confirmation
+  const [netPromptMonth, setNetPromptMonth] = useState(null); // month to prompt for after-tax net, or null
   const [statsSub, setStatsSub] = useState("calendar");
   const [saveError, setSaveError] = useState(false);
 
@@ -287,6 +318,7 @@ export default function App() {
           setWorkDays(parsed.workDays || []);
           setTips(migrateTips(parsed.tips));
           setFutureShifts(parsed.futureShifts || []);
+          setTipPeriodRanges(parsed.tipPeriodRanges || {});
           // Support both old (manualTaxes) and new (manualNetSalaries) formats
           if (parsed.manualNetSalaries) {
             setManualNetSalaries(parsed.manualNetSalaries);
@@ -317,6 +349,7 @@ export default function App() {
         tips: next.tips ?? tips,
         futureShifts: next.futureShifts ?? futureShifts,
         manualNetSalaries: next.manualNetSalaries ?? manualNetSalaries,
+        tipPeriodRanges: next.tipPeriodRanges ?? tipPeriodRanges,
       };
       const result = await window.storage.set(STORAGE_KEY, JSON.stringify(payload), false);
       if (!result) setSaveError(true);
@@ -339,6 +372,23 @@ export default function App() {
     const next = workDays.filter((w) => w.id !== id);
     setWorkDays(next);
     persist({ workDays: next });
+  }
+  function updateWorkDay(updated) {
+    const hours = calcHoursDecimal(updated.date && updated.start, updated.end, updated.breakMin);
+    const rate = getRateForDate(settings.rateHistory, updated.date);
+    const { gross, net } = calcPay(hours, rate, settings);
+    const row = { ...updated, breakMin: Number(updated.breakMin) || 0, hours, rate, gross, net };
+    const next = workDays.map((w) => (w.id === row.id ? row : w)).sort((a, b) => a.date.localeCompare(b.date));
+    setWorkDays(next);
+    persist({ workDays: next });
+  }
+  function setTipRangeField(month, period, field, value) {
+    const current = getTipRanges(tipPeriodRanges, month).map((r) => ({ ...r }));
+    const num = Number(value);
+    if (!isNaN(num)) current[period - 1] = { ...current[period - 1], [field]: num };
+    const next = { ...tipPeriodRanges, [month]: current };
+    setTipPeriodRanges(next);
+    persist({ tipPeriodRanges: next });
   }
   function upsertTip(month, period, amountStr) {
     const id = `${month}|${period}`;
@@ -434,7 +484,8 @@ export default function App() {
             avgIncomePerHour={avgIncomePerHour}
             onAddWork={() => setShowAddWork(true)}
             onGoToTips={() => setTab("tips")}
-            onDeleteWork={deleteWorkDay}
+            onEditWork={setEditingWorkDay}
+            onDeleteWork={setConfirmDeleteId}
             onSetManualNet={(val) => setManualNetForMonth(selectedMonth, val)}
           />
         )}
@@ -445,7 +496,8 @@ export default function App() {
             selectedMonth={selectedMonth}
             setSelectedMonth={setSelectedMonth}
             monthWorkDays={monthWorkDays}
-            onDelete={deleteWorkDay}
+            onEdit={setEditingWorkDay}
+            onDelete={setConfirmDeleteId}
           />
         )}
 
@@ -456,6 +508,8 @@ export default function App() {
             setSelectedMonth={setSelectedMonth}
             monthTips={monthTips}
             onUpsert={upsertTip}
+            tipRanges={getTipRanges(tipPeriodRanges, selectedMonth)}
+            onRangeChange={(period, field, value) => setTipRangeField(selectedMonth, period, field, value)}
           />
         )}
 
@@ -470,6 +524,7 @@ export default function App() {
             tips={tips}
             settings={settings}
             manualNetSalaries={manualNetSalaries}
+            tipPeriodRanges={tipPeriodRanges}
           />
         )}
 
@@ -498,6 +553,41 @@ export default function App() {
           onSave={(entry) => {
             addWorkDay(entry);
             setShowAddWork(false);
+            setNetPromptMonth(monthKey(entry.date));
+          }}
+        />
+      )}
+
+      {editingWorkDay && (
+        <EditWorkModal
+          settings={settings}
+          entry={editingWorkDay}
+          onClose={() => setEditingWorkDay(null)}
+          onSave={(updated) => {
+            updateWorkDay(updated);
+            setEditingWorkDay(null);
+          }}
+        />
+      )}
+
+      {confirmDeleteId && (
+        <ConfirmDeleteModal
+          onCancel={() => setConfirmDeleteId(null)}
+          onConfirm={() => {
+            deleteWorkDay(confirmDeleteId);
+            setConfirmDeleteId(null);
+          }}
+        />
+      )}
+
+      {netPromptMonth && (
+        <NetPayPromptModal
+          month={netPromptMonth}
+          currentValue={manualNetSalaries[netPromptMonth]}
+          onSkip={() => setNetPromptMonth(null)}
+          onSave={(val) => {
+            setManualNetForMonth(netPromptMonth, val);
+            setNetPromptMonth(null);
           }}
         />
       )}
@@ -555,7 +645,7 @@ function BottomNav({ tab, setTab }) {
 // ---------- Dashboard ----------
 function Dashboard({
   months, selectedMonth, setSelectedMonth, summary, settings,
-  monthWorkDays, monthTips, avgIncomePerHour, onAddWork, onGoToTips, onDeleteWork, onSetManualNet,
+  monthWorkDays, monthTips, avgIncomePerHour, onAddWork, onGoToTips, onEditWork, onDeleteWork, onSetManualNet,
 }) {
   const goal = settings.monthlyGoal;
   const pct = goal > 0 ? summary.total / goal : 0;
@@ -600,7 +690,7 @@ function Dashboard({
           <input
             type="number"
             step="0.01"
-            placeholder={fmtEuro(summary.net)}
+            placeholder={summary.net.toFixed(2)}
             value={netInput}
             onChange={(e) => {
               setNetInput(e.target.value);
@@ -656,22 +746,25 @@ function Dashboard({
       <div className="flex flex-col gap-2">
         {recent.length === 0 && <p className="text-sm text-zinc-500">Nothing logged yet this month.</p>}
         {recent.map((r) => (
-          <WorkRow key={r.id} row={r} onDelete={onDeleteWork} />
+          <WorkRow key={r.id} row={r} onEdit={onEditWork} onDelete={onDeleteWork} />
         ))}
       </div>
     </div>
   );
 }
 
-function WorkRow({ row, onDelete }) {
+function WorkRow({ row, onEdit, onDelete }) {
   return (
     <Card className="flex items-center justify-between">
-      <div>
+      <button onClick={() => onEdit(row)} className="flex-1 text-left">
         <p className="text-sm font-medium text-zinc-100">{shiftDayLabel(row.date)}</p>
         <p className="text-xs text-zinc-500">{row.start}–{row.end} · {formatHM(row.hours)}</p>
-      </div>
+      </button>
       <div className="flex items-center gap-3">
         <span className="font-mono text-emerald-400 text-sm tabular-nums">{fmtEuro(row.net)}</span>
+        <button onClick={() => onEdit(row)}>
+          <Pencil size={15} className="text-zinc-600" />
+        </button>
         <button onClick={() => onDelete(row.id)}>
           <Trash2 size={15} className="text-zinc-600" />
         </button>
@@ -681,7 +774,7 @@ function WorkRow({ row, onDelete }) {
 }
 
 // ---------- Work Log ----------
-function WorkLog({ months, selectedMonth, setSelectedMonth, monthWorkDays, onDelete }) {
+function WorkLog({ months, selectedMonth, setSelectedMonth, monthWorkDays, onEdit, onDelete }) {
   const sorted = [...monthWorkDays].sort((a, b) => b.date.localeCompare(a.date));
   const monthDaysCount = monthDays(selectedMonth);
   const firstDay = `${selectedMonth}-01`;
@@ -736,7 +829,7 @@ function WorkLog({ months, selectedMonth, setSelectedMonth, monthWorkDays, onDel
       <div className="flex flex-col gap-2">
         {filtered.length === 0 && <p className="text-sm text-zinc-500 text-center mt-6">No shifts in this date range.</p>}
         {filtered.map((r) => (
-          <WorkRow key={r.id} row={r} onDelete={onDelete} />
+          <WorkRow key={r.id} row={r} onEdit={onEdit} onDelete={onDelete} />
         ))}
       </div>
     </div>
@@ -744,7 +837,7 @@ function WorkLog({ months, selectedMonth, setSelectedMonth, monthWorkDays, onDel
 }
 
 // ---------- Tips ----------
-function TipsPage({ months, selectedMonth, setSelectedMonth, monthTips, onUpsert }) {
+function TipsPage({ months, selectedMonth, setSelectedMonth, monthTips, onUpsert, tipRanges, onRangeChange }) {
   const total = monthTips.reduce((s, t) => s + t.amount, 0);
   return (
     <div>
@@ -752,15 +845,20 @@ function TipsPage({ months, selectedMonth, setSelectedMonth, monthTips, onUpsert
       <Card className="mb-4">
         <StatBlock label="Tips this month" value={fmtEuro(total)} accent="text-amber-400" />
       </Card>
-      <p className="text-xs text-zinc-500 mb-3">Tips are paid out 3 times a month — enter each as you receive it.</p>
+      <p className="text-xs text-zinc-500 mb-3">
+        Tips are paid out 3 times a month. Defaults to days 1–10, 11–20, 21–end — tap the day numbers
+        below to adjust a range if a payout lands early or late.
+      </p>
       <div className="flex flex-col gap-3">
         {TIP_PERIODS.map((period) => (
           <TipPeriodCard
             key={period}
             month={selectedMonth}
             period={period}
+            range={tipRanges[period - 1]}
             amount={monthTips.find((t) => t.period === period)?.amount ?? ""}
             onUpsert={onUpsert}
+            onRangeChange={onRangeChange}
           />
         ))}
       </div>
@@ -768,7 +866,7 @@ function TipsPage({ months, selectedMonth, setSelectedMonth, monthTips, onUpsert
   );
 }
 
-function TipPeriodCard({ month, period, amount, onUpsert }) {
+function TipPeriodCard({ month, period, range, amount, onUpsert, onRangeChange }) {
   const [value, setValue] = useState(amount === "" ? "" : String(amount));
   useEffect(() => {
     setValue(amount === "" ? "" : String(amount));
@@ -776,8 +874,27 @@ function TipPeriodCard({ month, period, amount, onUpsert }) {
 
   return (
     <Card>
-      <div className="flex items-center justify-between mb-1">
-        <span className="text-sm font-medium text-zinc-200">Days {periodRangeLabel(month, period)}</span>
+      <div className="flex items-center justify-between mb-2">
+        <div className="flex items-center gap-1.5">
+          <span className="text-sm font-medium text-zinc-200">Days</span>
+          <input
+            type="number"
+            min={1}
+            max={31}
+            value={range.start}
+            onChange={(e) => onRangeChange(period, "start", e.target.value)}
+            className="w-11 bg-zinc-800 border border-zinc-700 rounded-lg px-1.5 py-1 text-center text-xs font-mono text-zinc-50 focus:outline-none focus:ring-1 focus:ring-emerald-400/60"
+          />
+          <span className="text-zinc-500">–</span>
+          <input
+            type="number"
+            min={1}
+            max={31}
+            value={range.end}
+            onChange={(e) => onRangeChange(period, "end", e.target.value)}
+            className="w-11 bg-zinc-800 border border-zinc-700 rounded-lg px-1.5 py-1 text-center text-xs font-mono text-zinc-50 focus:outline-none focus:ring-1 focus:ring-emerald-400/60"
+          />
+        </div>
         <Coins size={15} className="text-amber-400" />
       </div>
       <div className="flex items-center gap-2 mt-1">
@@ -799,9 +916,10 @@ function TipPeriodCard({ month, period, amount, onUpsert }) {
 }
 
 // ---------- Stats ----------
-function StatsPage({ statsSub, setStatsSub, months, selectedMonth, setSelectedMonth, workDays, tips, settings, manualNetSalaries }) {
+function StatsPage({ statsSub, setStatsSub, months, selectedMonth, setSelectedMonth, workDays, tips, settings, manualNetSalaries, tipPeriodRanges }) {
   const monthWorkDays = workDays.filter((w) => monthKey(w.date) === selectedMonth);
   const monthTips = tips.filter((t) => t.month === selectedMonth);
+  const tipRanges = getTipRanges(tipPeriodRanges, selectedMonth);
 
   const totalHours = monthWorkDays.reduce((s, d) => s + d.hours, 0);
   const gross = monthWorkDays.reduce((s, d) => s + d.gross, 0);
@@ -842,13 +960,13 @@ function StatsPage({ statsSub, setStatsSub, months, selectedMonth, setSelectedMo
   });
   const incomeByPeriod = TIP_PERIODS.map((period) => {
     const workNet = monthWorkDays
-      .filter((d) => periodForDay(Number(d.date.slice(8, 10))) === period)
+      .filter((d) => periodForDayInRanges(Number(d.date.slice(8, 10)), tipRanges) === period)
       .reduce((s, d) => s + d.net, 0);
     const tipAmt = monthTips.find((t) => t.period === period)?.amount || 0;
-    return { period: periodRangeLabel(selectedMonth, period), income: Math.round((workNet + tipAmt) * 100) / 100 };
+    return { period: tipRangeLabel(tipRanges, period), income: Math.round((workNet + tipAmt) * 100) / 100 };
   });
   const tipTrend = TIP_PERIODS.map((period) => ({
-    period: periodRangeLabel(selectedMonth, period),
+    period: tipRangeLabel(tipRanges, period),
     tip: monthTips.find((t) => t.period === period)?.amount || 0,
   }));
 
@@ -1335,6 +1453,113 @@ function AddWorkModal({ settings, onClose, onSave }) {
       >
         Save
       </button>
+    </Modal>
+  );
+}
+
+function EditWorkModal({ settings, entry, onClose, onSave }) {
+  const [date, setDate] = useState(entry.date);
+  const [start, setStart] = useState(entry.start);
+  const [end, setEnd] = useState(entry.end);
+  const [breakMin, setBreakMin] = useState(entry.breakMin || 0);
+
+  const hours = calcHoursDecimal(start, end, breakMin);
+  const rate = getRateForDate(settings.rateHistory, date);
+  const { gross, net } = calcPay(hours, rate, settings);
+
+  return (
+    <Modal title="Edit Work Day" onClose={onClose}>
+      <Field label="Date">
+        <input type="date" value={date} onChange={(e) => setDate(e.target.value)} className={inputClass} />
+      </Field>
+      <div className="grid grid-cols-2 gap-2">
+        <Field label="Start">
+          <input type="time" value={start} onChange={(e) => setStart(e.target.value)} className={inputClass} />
+        </Field>
+        <Field label="End">
+          <input type="time" value={end} onChange={(e) => setEnd(e.target.value)} className={inputClass} />
+        </Field>
+      </div>
+      <Field label="Break (minutes)">
+        <input type="number" value={breakMin} onChange={(e) => setBreakMin(e.target.value)} className={inputClass} />
+      </Field>
+
+      <div className="bg-zinc-800/60 rounded-xl p-3 my-3 grid grid-cols-3 gap-2 text-center">
+        <div>
+          <p className="text-[10px] text-zinc-500">Hours</p>
+          <p className="font-mono text-sm text-zinc-100">{formatHM(hours)}</p>
+        </div>
+        <div>
+          <p className="text-[10px] text-zinc-500">Gross</p>
+          <p className="font-mono text-sm text-sky-400">{fmtEuro(gross)}</p>
+        </div>
+        <div>
+          <p className="text-[10px] text-zinc-500">Net</p>
+          <p className="font-mono text-sm text-emerald-400">{fmtEuro(net)}</p>
+        </div>
+      </div>
+      <p className="text-[11px] text-zinc-500 -mt-2 mb-3">Using rate {fmtEuro(rate)}/h for this date.</p>
+
+      <button
+        onClick={() => onSave({ ...entry, date, start, end, breakMin })}
+        className="w-full bg-emerald-400 text-zinc-950 font-medium rounded-xl py-2.5"
+      >
+        Save Changes
+      </button>
+    </Modal>
+  );
+}
+
+function ConfirmDeleteModal({ onCancel, onConfirm }) {
+  return (
+    <Modal title="Delete Entry?" onClose={onCancel}>
+      <p className="text-sm text-zinc-400 mb-4">
+        This work log entry will be permanently removed. This can't be undone.
+      </p>
+      <div className="grid grid-cols-2 gap-2">
+        <button onClick={onCancel} className="w-full bg-zinc-800 text-zinc-300 font-medium rounded-xl py-2.5">
+          Cancel
+        </button>
+        <button onClick={onConfirm} className="w-full bg-red-500 text-zinc-950 font-medium rounded-xl py-2.5">
+          Delete
+        </button>
+      </div>
+    </Modal>
+  );
+}
+
+function NetPayPromptModal({ month, currentValue, onSkip, onSave }) {
+  const [value, setValue] = useState(currentValue != null ? String(currentValue) : "");
+
+  return (
+    <Modal title={`Net Pay After Tax — ${monthLabel(month)}`} onClose={onSkip}>
+      <p className="text-xs text-zinc-500 mb-3">
+        If you know your after-tax net salary for {monthLabel(month)}, enter it now and it'll be saved
+        as your "Net Salary (after all taxes)" for the month. You can skip and update it later on the
+        Dashboard.
+      </p>
+      <Field label="Net pay after tax">
+        <div className="flex items-center gap-2 bg-zinc-800 border border-zinc-700 rounded-xl px-3 py-2">
+          <span className="text-zinc-500">€</span>
+          <input
+            type="number"
+            step="0.01"
+            placeholder="0.00"
+            value={value}
+            onChange={(e) => setValue(e.target.value)}
+            autoFocus
+            className="w-full bg-transparent text-zinc-50 text-sm focus:outline-none"
+          />
+        </div>
+      </Field>
+      <div className="grid grid-cols-2 gap-2 mt-1">
+        <button onClick={onSkip} className="w-full bg-zinc-800 text-zinc-300 font-medium rounded-xl py-2.5">
+          Skip
+        </button>
+        <button onClick={() => onSave(value)} className="w-full bg-emerald-400 text-zinc-950 font-medium rounded-xl py-2.5">
+          Save
+        </button>
+      </div>
     </Modal>
   );
 }
