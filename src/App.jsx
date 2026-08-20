@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useMemo } from "react";
 import {
   Home, Clock, Coins, BarChart3, TrendingUp, Settings as SettingsIcon,
-  Plus, X, Trash2, ChevronLeft, ChevronRight, Target, CalendarDays, Flame, Pencil,
+  Plus, X, Trash2, ChevronLeft, ChevronRight, Target, Pencil, Heart, Sparkles,
 } from "lucide-react";
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
@@ -9,9 +9,90 @@ import {
 
 const STORAGE_KEY = "wage-tracker-data-v1";
 
+/* ============================================================
+   THEME — cream base, cherry / bow / gingham cottagecore palette
+   ============================================================ */
+const C = {
+  bg: "#FBF1E2",
+  bgStripeA: "#FBF1E2",
+  bgStripeB: "#F5E9D6",
+  card: "#FFFBF3",
+  cardAlt: "#FDF1E9",
+  ink: "#5B4238",
+  inkSoft: "#A48A7B",
+  line: "#EEDDC4",
+  pink: "#F3B7C7",
+  pinkDeep: "#E0839C",
+  pinkText: "#B85C77",
+  rose: "#C1495A",
+  roseDeep: "#A23649",
+  sage: "#9FB37E",
+  sageDeep: "#748C57",
+  sageText: "#5D7442",
+  blue: "#AAD0E3",
+  blueDeep: "#6FA6C7",
+  blueText: "#4F7F9C",
+  lavender: "#DAC8ED",
+  lavenderDeep: "#B79AD6",
+  honey: "#F0CE83",
+  honeyDeep: "#D8A83A",
+  honeyText: "#9C7521",
+  red: "#DE8686",
+  redDeep: "#C05B5B",
+  white: "#FFFFFF",
+};
+
+// each month gets its own patchwork wallpaper — alternating candy stripes and
+// gingham checks in different pastel colorways, echoing the sticker-sheet
+// reference (pink cherries / green stripes / blue gingham / lavender bows...)
+const WALLPAPERS = [
+  { mode: "stripe", color: C.pink },
+  { mode: "gingham", color: C.sage },
+  { mode: "stripe", color: C.blue },
+  { mode: "gingham", color: C.pink },
+  { mode: "stripe", color: C.lavender },
+  { mode: "gingham", color: C.blue },
+  { mode: "stripe", color: C.honey },
+  { mode: "gingham", color: C.lavender },
+];
+function wallpaperForMonth(monthKeyStr) {
+  let hash = 0;
+  for (let i = 0; i < (monthKeyStr || "").length; i++) hash = (hash * 31 + monthKeyStr.charCodeAt(i)) >>> 0;
+  return WALLPAPERS[hash % WALLPAPERS.length];
+}
+function wallpaperStyle({ mode, color }) {
+  if (mode === "gingham") {
+    return {
+      backgroundColor: C.bg,
+      backgroundImage: `repeating-linear-gradient(0deg, ${color}3d 0 16px, transparent 16px 32px), repeating-linear-gradient(90deg, ${color}3d 0 16px, transparent 16px 32px)`,
+    };
+  }
+  return {
+    backgroundColor: C.bg,
+    backgroundImage: `repeating-linear-gradient(90deg, ${color}40 0 26px, transparent 26px 60px)`,
+  };
+}
+
+const FONT_DISPLAY = "'Baloo 2', 'Quicksand', sans-serif";
+const FONT_BODY = "'Nunito', sans-serif";
+
+function FontLoader() {
+  return (
+    <style>{`
+      @import url('https://fonts.googleapis.com/css2?family=Baloo+2:wght@500;600;700;800&family=Nunito:wght@400;600;700;800&display=swap');
+      * { box-sizing: border-box; }
+      body { font-family: ${FONT_BODY}; }
+      input[type="date"]::-webkit-calendar-picker-indicator,
+      input[type="time"]::-webkit-calendar-picker-indicator { opacity: 0.6; }
+      ::-webkit-scrollbar { width: 6px; height: 6px; }
+      ::-webkit-scrollbar-thumb { background: ${C.line}; border-radius: 10px; }
+    `}</style>
+  );
+}
+
+const STORAGE_KEY_ = STORAGE_KEY; // keep name stable
+
 const DEFAULT_SETTINGS = {
-  // Rate history: list of { date, rate }. The rate that applies to a shift
-  // is the most recent entry whose date is on or before the shift's date.
   rateHistory: [
     { date: "2026-01-01", rate: 14.71 },
     { date: "2026-07-01", rate: 14.99 },
@@ -38,7 +119,6 @@ function getRateForDate(rateHistory, dateStr) {
   return applicable;
 }
 
-// Migrates old settings shape (single hourlyRate number) to rateHistory.
 function migrateSettings(raw) {
   const merged = { ...DEFAULT_SETTINGS, ...(raw || {}) };
   if (!merged.rateHistory || !merged.rateHistory.length) {
@@ -53,7 +133,7 @@ function migrateSettings(raw) {
   return merged;
 }
 
-// ---------- helpers ----------
+/* ---------- helpers (unchanged business logic) ---------- */
 function uid() {
   return Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
 }
@@ -112,7 +192,7 @@ function shiftDayLabel(dateStr) {
 }
 function weekdayIdx(dateStr) {
   const d = new Date(dateStr + "T00:00:00");
-  return (d.getDay() + 6) % 7; // 0=Mon .. 6=Sun
+  return (d.getDay() + 6) % 7;
 }
 const WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 
@@ -122,12 +202,9 @@ function monthDays(key) {
 }
 function monthFirstWeekday(key) {
   const [y, m] = key.split("-").map(Number);
-  return (new Date(y, m - 1, 1).getDay() + 6) % 7; // 0=Mon
+  return (new Date(y, m - 1, 1).getDay() + 6) % 7;
 }
 
-// Tips are paid out 3x per month. Defaults to days 1-10, 11-20, and 21-end,
-// but each range is editable per month (payouts aren't always exactly every
-// 10 days).
 const TIP_PERIODS = [1, 2, 3];
 function defaultTipRanges(month) {
   return [
@@ -136,8 +213,6 @@ function defaultTipRanges(month) {
     { start: 21, end: monthDays(month) },
   ];
 }
-// Looks up the (possibly customized) ranges for a month, falling back to the
-// default 1-10/11-20/21-end split.
 function getTipRanges(tipPeriodRanges, month) {
   const custom = tipPeriodRanges && tipPeriodRanges[month];
   if (custom && custom.length === 3) return custom;
@@ -147,9 +222,6 @@ function tipRangeLabel(ranges, period) {
   const r = ranges[period - 1];
   return `${r.start}–${r.end}`;
 }
-// Finds which period (1/2/3) a given day-of-month falls into, given a set
-// of ranges. Falls back to the nearest period if the day is outside all of
-// them (e.g. ranges were edited to leave a gap).
 function periodForDayInRanges(day, ranges) {
   for (let i = 0; i < ranges.length; i++) {
     if (day >= ranges[i].start && day <= ranges[i].end) return i + 1;
@@ -157,16 +229,11 @@ function periodForDayInRanges(day, ranges) {
   if (day < ranges[0].start) return 1;
   return ranges.length;
 }
-// Fixed 1-10/11-20/21-end split, used only for one-time migration of legacy
-// date-based tip entries (see migrateTips below).
 function periodForDay(day) {
   if (day <= 10) return 1;
   if (day <= 20) return 2;
   return 3;
 }
-// Migrates old {id, date, amount} tip entries into the new
-// {id, month, period, amount} shape, summing anything that lands in the
-// same period.
 function migrateTips(rawTips) {
   const buckets = {};
   (rawTips || []).forEach((t) => {
@@ -189,42 +256,88 @@ function migrateTips(rawTips) {
   });
 }
 
-// ---------- small UI atoms ----------
-function Card({ children, className = "" }) {
+/* ============================================================
+   small UI atoms — reskinned
+   ============================================================ */
+
+// soft dashed/gingham backdrop strip used behind headers
+function GinghamStrip({ color = C.pink, height = 10 }) {
   return (
-    <div className={`bg-zinc-900 border border-zinc-800 rounded-2xl p-4 ${className}`}>
+    <div
+      style={{
+        height,
+        width: "100%",
+        backgroundImage: `repeating-linear-gradient(45deg, ${color}55 0, ${color}55 6px, transparent 6px, transparent 12px)`,
+        borderRadius: 999,
+      }}
+    />
+  );
+}
+
+function Card({ children, className = "", accent, style = {} }) {
+  return (
+    <div
+      className={`rounded-3xl p-4 ${className}`}
+      style={{
+        background: C.card,
+        border: `2px solid ${accent ? accent + "77" : C.line}`,
+        boxShadow: `0 2px 0 ${C.line}, 0 6px 14px -8px rgba(91,66,56,0.18)`,
+        ...style,
+      }}
+    >
       {children}
     </div>
   );
 }
-function StatBlock({ label, value, accent = "text-zinc-50", sub }) {
+
+function SectionTitle({ icon: Icon, children, color = C.pinkText }) {
   return (
-    <div className="flex flex-col gap-1">
-      <span className="text-xs uppercase tracking-wide text-zinc-500">{label}</span>
-      <span className={`font-mono text-xl tabular-nums font-semibold ${accent}`}>{value}</span>
-      {sub && <span className="text-xs text-zinc-500">{sub}</span>}
+    <div className="flex items-center gap-1.5 mb-2">
+      {Icon && <Icon size={13} style={{ color }} />}
+      <span className="text-xs font-bold uppercase tracking-wide" style={{ color, fontFamily: FONT_BODY }}>
+        {children}
+      </span>
     </div>
   );
 }
-function ProgressBar({ pct, colorClass = "bg-emerald-400" }) {
+
+function StatBlock({ label, value, accent = C.ink, sub }) {
+  return (
+    <div className="flex flex-col gap-1">
+      <span className="text-[11px] font-bold uppercase tracking-wide" style={{ color: C.inkSoft }}>{label}</span>
+      <span className="text-xl font-extrabold tabular-nums" style={{ color: accent, fontFamily: FONT_DISPLAY }}>{value}</span>
+      {sub && <span className="text-[11px]" style={{ color: C.inkSoft }}>{sub}</span>}
+    </div>
+  );
+}
+
+function ProgressBar({ pct, color = C.pink, colorDeep = C.pinkDeep }) {
   const clamped = Math.max(0, Math.min(1, pct || 0));
   return (
-    <div className="w-full h-3 rounded-full bg-zinc-800 overflow-hidden">
+    <div className="w-full h-3.5 rounded-full overflow-hidden" style={{ background: C.cardAlt, border: `1.5px solid ${C.line}` }}>
       <div
-        className={`h-full ${colorClass} transition-all duration-500 rounded-full`}
-        style={{ width: `${clamped * 100}%` }}
+        className="h-full rounded-full transition-all duration-500"
+        style={{ width: `${clamped * 100}%`, background: `linear-gradient(90deg, ${color}, ${colorDeep})` }}
       />
     </div>
   );
 }
-function ProgressRing({ pct, size = 176, strokeWidth = 14 }) {
+
+function ProgressRing({ pct, size = 178, strokeWidth = 16 }) {
   const radius = (size - strokeWidth) / 2;
   const circumference = 2 * Math.PI * radius;
   const clamped = Math.max(0, Math.min(1, pct || 0));
   const offset = circumference * (1 - clamped);
+  const gradId = "ringGrad";
   return (
     <svg width={size} height={size} className="-rotate-90">
-      <circle cx={size / 2} cy={size / 2} r={radius} strokeWidth={strokeWidth} className="stroke-zinc-800" fill="none" />
+      <defs>
+        <linearGradient id={gradId} x1="0%" y1="0%" x2="100%" y2="100%">
+          <stop offset="0%" stopColor={C.pink} />
+          <stop offset="100%" stopColor={C.rose} />
+        </linearGradient>
+      </defs>
+      <circle cx={size / 2} cy={size / 2} r={radius} strokeWidth={strokeWidth} stroke={C.cardAlt} fill="none" />
       <circle
         cx={size / 2}
         cy={size / 2}
@@ -233,13 +346,48 @@ function ProgressRing({ pct, size = 176, strokeWidth = 14 }) {
         strokeDasharray={circumference}
         strokeDashoffset={offset}
         strokeLinecap="round"
-        className="stroke-emerald-400"
+        stroke={`url(#${gradId})`}
         fill="none"
         style={{ transition: "stroke-dashoffset 0.6s ease" }}
       />
     </svg>
   );
 }
+
+// builds a smooth closed "wavy flower" outline — radius oscillates around the
+// circle, like the scalloped medallion stickers in the reference images
+function scallopPath(cx, cy, baseR, amplitude, bumps, steps = 240) {
+  let d = "";
+  for (let i = 0; i <= steps; i++) {
+    const t = (i / steps) * Math.PI * 2;
+    const rad = baseR + amplitude * Math.cos(bumps * t);
+    const x = cx + rad * Math.cos(t);
+    const y = cy + rad * Math.sin(t);
+    d += `${i === 0 ? "M" : "L"}${x.toFixed(2)},${y.toFixed(2)} `;
+  }
+  return d + "Z";
+}
+
+// scalloped sticker medallion frame, echoes the flower/heart badges in the
+// reference images — one clean wavy outline, no gaps or overlaps
+function ScallopFrame({ size = 210, ringColor = C.pink, children }) {
+  const cx = size / 2;
+  const cy = size / 2;
+  const amplitude = size * 0.035;
+  const baseR = size / 2 - amplitude - 3;
+  const outerPath = scallopPath(cx, cy, baseR, amplitude, 14);
+  const innerPath = scallopPath(cx, cy, baseR - size * 0.052, amplitude * 0.72, 14);
+  return (
+    <div className="relative flex items-center justify-center" style={{ width: size, height: size }}>
+      <svg width={size} height={size} className="absolute inset-0">
+        <path d={outerPath} fill={C.card} stroke={ringColor} strokeWidth={2.5} strokeLinejoin="round" />
+        <path d={innerPath} fill="none" stroke={ringColor} strokeWidth={1.5} opacity={0.55} strokeLinejoin="round" />
+      </svg>
+      <div className="relative z-10 flex items-center justify-center">{children}</div>
+    </div>
+  );
+}
+
 function MonthNav({ months, selected, onChange }) {
   const idx = months.indexOf(selected);
   return (
@@ -247,32 +395,38 @@ function MonthNav({ months, selected, onChange }) {
       <button
         disabled={idx <= 0}
         onClick={() => onChange(months[idx - 1])}
-        className="p-1.5 rounded-full bg-zinc-900 border border-zinc-800 disabled:opacity-30"
+        className="p-1.5 rounded-full disabled:opacity-30"
+        style={{ background: C.card, border: `2px solid ${C.line}` }}
       >
-        <ChevronLeft size={16} className="text-zinc-300" />
+        <ChevronLeft size={16} style={{ color: C.pinkText }} />
       </button>
-      <span className="text-sm font-medium text-zinc-200 w-40 text-center">{monthLabel(selected)}</span>
+      <span className="text-sm font-bold w-40 text-center" style={{ color: C.ink, fontFamily: FONT_DISPLAY }}>
+        {monthLabel(selected)}
+      </span>
       <button
         disabled={idx >= months.length - 1}
         onClick={() => onChange(months[idx + 1])}
-        className="p-1.5 rounded-full bg-zinc-900 border border-zinc-800 disabled:opacity-30"
+        className="p-1.5 rounded-full disabled:opacity-30"
+        style={{ background: C.card, border: `2px solid ${C.line}` }}
       >
-        <ChevronRight size={16} className="text-zinc-300" />
+        <ChevronRight size={16} style={{ color: C.pinkText }} />
       </button>
     </div>
   );
 }
+
 function Modal({ title, onClose, children }) {
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4" onClick={onClose}>
+    <div className="fixed inset-0 z-50 flex items-center justify-center px-4" style={{ background: "rgba(91,66,56,0.35)" }} onClick={onClose}>
       <div
-        className="bg-zinc-900 border border-zinc-800 rounded-3xl w-full sm:w-96 p-5 max-h-[85vh] overflow-y-auto"
+        className="w-full sm:w-96 p-5 max-h-[85vh] overflow-y-auto rounded-3xl"
+        style={{ background: C.card, border: `2px solid ${C.line}`, boxShadow: `0 12px 0 -6px ${C.line}` }}
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between mb-4">
-          <h3 className="text-zinc-50 font-semibold text-lg">{title}</h3>
-          <button onClick={onClose} className="p-1 rounded-full bg-zinc-800">
-            <X size={16} className="text-zinc-400" />
+          <h3 className="font-extrabold text-lg" style={{ color: C.ink, fontFamily: FONT_DISPLAY }}>{title}</h3>
+          <button onClick={onClose} className="p-1.5 rounded-full" style={{ background: C.cardAlt }}>
+            <X size={15} style={{ color: C.inkSoft }} />
           </button>
         </div>
         {children}
@@ -280,31 +434,66 @@ function Modal({ title, onClose, children }) {
     </div>
   );
 }
+
 function Field({ label, children }) {
   return (
     <div className="mb-3">
-      <label className="block text-xs text-zinc-500 mb-1">{label}</label>
+      <label className="block text-[11px] font-bold mb-1" style={{ color: C.inkSoft }}>{label}</label>
       {children}
     </div>
   );
 }
-const inputClass =
-  "w-full bg-zinc-800 border border-zinc-700 rounded-xl px-3 py-2 text-zinc-50 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-400/60";
 
-// ---------- main app ----------
+const inputStyle = {
+  width: "100%",
+  background: C.cardAlt,
+  border: `2px solid ${C.line}`,
+  borderRadius: "0.9rem",
+  padding: "0.5rem 0.75rem",
+  color: C.ink,
+  fontSize: "0.875rem",
+  outline: "none",
+};
+function StyledInput(props) {
+  return <input {...props} style={{ ...inputStyle, ...(props.style || {}) }} />;
+}
+
+function PillButton({ children, onClick, bg = C.pink, bgDeep = C.pinkDeep, text = C.white, disabled, style = {}, className = "" }) {
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      className={`flex items-center justify-center gap-2 font-extrabold rounded-2xl py-3 transition-transform active:translate-y-[2px] ${className}`}
+      style={{
+        background: bg,
+        color: text,
+        fontFamily: FONT_DISPLAY,
+        boxShadow: disabled ? "none" : `0 4px 0 ${bgDeep}`,
+        opacity: disabled ? 0.5 : 1,
+        ...style,
+      }}
+    >
+      {children}
+    </button>
+  );
+}
+
+/* ============================================================
+   main app
+   ============================================================ */
 export default function App() {
   const [loaded, setLoaded] = useState(false);
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
   const [workDays, setWorkDays] = useState([]);
   const [tips, setTips] = useState([]);
   const [futureShifts, setFutureShifts] = useState([]);
-  const [manualNetSalaries, setManualNetSalaries] = useState({}); // { "2026-07": 1234.56, ... } - final net after all taxes
-  const [tipPeriodRanges, setTipPeriodRanges] = useState({}); // { "2026-07": [{start,end} x3], ... }
+  const [manualNetSalaries, setManualNetSalaries] = useState({});
+  const [tipPeriodRanges, setTipPeriodRanges] = useState({});
   const [tab, setTab] = useState("dashboard");
   const [showAddWork, setShowAddWork] = useState(false);
-  const [editingWorkDay, setEditingWorkDay] = useState(null); // work day row being edited, or null
-  const [confirmDeleteId, setConfirmDeleteId] = useState(null); // work day id pending delete confirmation
-  const [netPromptMonth, setNetPromptMonth] = useState(null); // month to prompt for after-tax net, or null
+  const [editingWorkDay, setEditingWorkDay] = useState(null);
+  const [confirmDeleteId, setConfirmDeleteId] = useState(null);
+  const [netPromptMonth, setNetPromptMonth] = useState(null);
   const [statsSub, setStatsSub] = useState("calendar");
   const [saveError, setSaveError] = useState(false);
 
@@ -319,15 +508,12 @@ export default function App() {
           setTips(migrateTips(parsed.tips));
           setFutureShifts(parsed.futureShifts || []);
           setTipPeriodRanges(parsed.tipPeriodRanges || {});
-          // Support both old (manualTaxes) and new (manualNetSalaries) formats
           if (parsed.manualNetSalaries) {
             setManualNetSalaries(parsed.manualNetSalaries);
           } else if (parsed.manualTaxes) {
-            // Migrate old format: convert from "tax deducted" to "final net salary"
             const migrated = {};
             Object.entries(parsed.manualTaxes).forEach(([month, tax]) => {
-              // Find the month's automatic net and subtract the old tax
-              const monthWork = (parsed.workDays || []).filter(w => monthKey(w.date) === month);
+              const monthWork = (parsed.workDays || []).filter((w) => monthKey(w.date) === month);
               const autoNet = monthWork.reduce((s, d) => s + d.net, 0);
               migrated[month] = autoNet - tax;
             });
@@ -422,7 +608,6 @@ export default function App() {
     persist({ manualNetSalaries: next });
   }
 
-  // months present in data (+ current month always included)
   const months = useMemo(() => {
     const set = new Set([todayStr().slice(0, 7)]);
     workDays.forEach((w) => set.add(monthKey(w.date)));
@@ -441,9 +626,9 @@ export default function App() {
   const summary = useMemo(() => {
     const totalHours = monthWorkDays.reduce((s, d) => s + d.hours, 0);
     const gross = monthWorkDays.reduce((s, d) => s + d.gross, 0);
-    const net = monthWorkDays.reduce((s, d) => s + d.net, 0); // after pension, before additional tax
+    const net = monthWorkDays.reduce((s, d) => s + d.net, 0);
     const tipsSum = monthTips.reduce((s, t) => s + t.amount, 0);
-    const manualNetSalary = manualNetSalaries[selectedMonth]; // This is the FINAL net after all taxes
+    const manualNetSalary = manualNetSalaries[selectedMonth];
     const hasManualEntry = typeof manualNetSalary === "number";
     const netFinal = hasManualEntry ? manualNetSalary : net;
     return { totalHours, gross, net, manualNetSalary, hasManualEntry, netFinal, tipsSum, total: netFinal + tipsSum };
@@ -456,18 +641,29 @@ export default function App() {
 
   if (!loaded) {
     return (
-      <div className="min-h-screen bg-zinc-950 flex items-center justify-center">
-        <span className="text-zinc-500 text-sm">Loading…</span>
+      <div className="min-h-screen flex items-center justify-center" style={{ background: C.bg }}>
+        <FontLoader />
+        <span className="text-sm font-bold" style={{ color: C.inkSoft, fontFamily: FONT_DISPLAY }}>Loading… 🍒</span>
       </div>
     );
   }
 
+  const wallpaper = wallpaperForMonth(selectedMonth);
+
   return (
-    <div className="min-h-screen bg-zinc-950 text-zinc-50 font-sans pb-24">
+    <div
+      className="min-h-screen pb-28 transition-[background] duration-500"
+      style={{
+        ...wallpaperStyle(wallpaper),
+        color: C.ink,
+        fontFamily: FONT_BODY,
+      }}
+    >
+      <FontLoader />
       <div className="max-w-md mx-auto px-4 pt-6">
         <TopBar tab={tab} />
         {saveError && (
-          <div className="mb-3 text-xs text-amber-400 bg-amber-400/10 border border-amber-400/30 rounded-xl px-3 py-2">
+          <div className="mb-3 text-xs font-bold rounded-2xl px-3 py-2" style={{ color: C.roseDeep, background: `${C.rose}22`, border: `2px solid ${C.rose}55` }}>
             Couldn't save your data. Changes may not persist.
           </div>
         )}
@@ -596,17 +792,9 @@ export default function App() {
 }
 
 function TopBar({ tab }) {
-  const titles = {
-    dashboard: "Dashboard",
-    worklog: "Work Log",
-    tips: "Tips",
-    stats: "Monthly Statistics",
-    prediction: "Salary Prediction",
-    settings: "Settings",
-  };
   return (
-    <div className="mb-4">
-      <h1 className="text-2xl font-bold tracking-tight text-zinc-50">{titles[tab]}</h1>
+    <div className="mb-3 pt-1">
+      <GinghamStrip color={C.pink} height={6} />
     </div>
   );
 }
@@ -621,19 +809,23 @@ function BottomNav({ tab, setTab }) {
     { id: "settings", icon: SettingsIcon, label: "Settings" },
   ];
   return (
-    <div className="fixed bottom-0 left-0 right-0 bg-zinc-900/95 backdrop-blur border-t border-zinc-800">
-      <div className="max-w-md mx-auto grid grid-cols-6">
+    <div className="fixed bottom-0 left-0 right-0 px-3 pb-3">
+      <div
+        className="max-w-md mx-auto grid grid-cols-6 rounded-3xl"
+        style={{ background: C.card, border: `2px solid ${C.line}`, boxShadow: `0 6px 18px -8px rgba(91,66,56,0.28)` }}
+      >
         {items.map((it) => {
           const Icon = it.icon;
           const active = tab === it.id;
           return (
-            <button
-              key={it.id}
-              onClick={() => setTab(it.id)}
-              className="flex flex-col items-center gap-0.5 py-2.5"
-            >
-              <Icon size={20} className={active ? "text-emerald-400" : "text-zinc-500"} />
-              <span className={`text-[10px] ${active ? "text-emerald-400" : "text-zinc-500"}`}>{it.label}</span>
+            <button key={it.id} onClick={() => setTab(it.id)} className="flex flex-col items-center gap-1 py-2.5">
+              <div
+                className="flex items-center justify-center rounded-full transition-colors"
+                style={{ width: 30, height: 30, background: active ? C.pink : "transparent" }}
+              >
+                <Icon size={16} style={{ color: active ? C.white : C.inkSoft }} />
+              </div>
+              <span className="text-[9px] font-bold" style={{ color: active ? C.pinkText : C.inkSoft }}>{it.label}</span>
             </button>
           );
         })}
@@ -642,7 +834,7 @@ function BottomNav({ tab, setTab }) {
   );
 }
 
-// ---------- Dashboard ----------
+/* ---------- Dashboard ---------- */
 function Dashboard({
   months, selectedMonth, setSelectedMonth, summary, settings,
   monthWorkDays, monthTips, avgIncomePerHour, onAddWork, onGoToTips, onEditWork, onDeleteWork, onSetManualNet,
@@ -666,27 +858,28 @@ function Dashboard({
       <MonthNav months={months} selected={selectedMonth} onChange={setSelectedMonth} />
 
       <div className="flex flex-col items-center mb-5">
-        <div className="relative">
-          <ProgressRing pct={pct} />
-          <div className="absolute inset-0 flex flex-col items-center justify-center">
-            <span className="text-xs text-zinc-500 uppercase tracking-wide">Total Earned</span>
-            <span className="font-mono text-2xl font-bold tabular-nums text-zinc-50">{fmtEuro(summary.total)}</span>
-            <span className="text-xs text-zinc-500 mt-1">of {fmtEuro(goal)} goal</span>
+        <ScallopFrame size={200}>
+          <ProgressRing pct={pct} size={148} strokeWidth={13} />
+          <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none">
+            <span style={{ fontSize: 16, marginBottom: -2 }}>🍒</span>
+            <span className="text-[10px] font-bold uppercase tracking-wide" style={{ color: C.inkSoft }}>Total Earned</span>
+            <span className="text-xl font-extrabold tabular-nums" style={{ color: C.ink, fontFamily: FONT_DISPLAY }}>{fmtEuro(summary.total)}</span>
+            <span className="text-[10px]" style={{ color: C.inkSoft }}>of {fmtEuro(goal)} goal</span>
           </div>
-        </div>
+        </ScallopFrame>
       </div>
 
       <div className="grid grid-cols-2 gap-3 mb-4">
         <Card><StatBlock label="Worked Hours" value={formatHM(summary.totalHours)} /></Card>
-        <Card><StatBlock label="Gross Salary" value={fmtEuro(summary.gross)} accent="text-sky-400" /></Card>
-        <Card><StatBlock label="Net" value={fmtEuro(summary.net)} accent="text-emerald-400" /></Card>
-        <Card><StatBlock label="Tips" value={fmtEuro(summary.tipsSum)} accent="text-amber-400" /></Card>
+        <Card><StatBlock label="Gross Salary" value={fmtEuro(summary.gross)} accent={C.blueText} /></Card>
+        <Card><StatBlock label="Net" value={fmtEuro(summary.net)} accent={C.sageText} /></Card>
+        <Card><StatBlock label="Tips" value={fmtEuro(summary.tipsSum)} accent={C.honeyText} /></Card>
       </div>
 
       <Card className="mb-4">
-        <span className="text-xs uppercase tracking-wide text-zinc-500">Net Salary (after all taxes)</span>
+        <SectionTitle icon={Sparkles}>Net Salary (after all taxes)</SectionTitle>
         <div className="flex items-center gap-2 mt-1">
-          <span className="text-zinc-500">€</span>
+          <span style={{ color: C.inkSoft }}>€</span>
           <input
             type="number"
             step="0.01"
@@ -696,55 +889,48 @@ function Dashboard({
               setNetInput(e.target.value);
               onSetManualNet(e.target.value);
             }}
-            className="w-full bg-transparent text-lg font-mono tabular-nums text-emerald-400 focus:outline-none"
+            className="w-full bg-transparent text-lg font-extrabold tabular-nums focus:outline-none"
+            style={{ color: C.sageText, fontFamily: FONT_DISPLAY }}
           />
         </div>
-        <p className="text-xs text-zinc-500 mt-1">
-          {summary.hasManualEntry ? (
-            <>Manually entered: {fmtEuro(summary.netFinal)}</>
-          ) : (
-            <>Auto-calculated from work log: {fmtEuro(summary.net)}</>
-          )}
+        <p className="text-[11px] mt-1" style={{ color: C.inkSoft }}>
+          {summary.hasManualEntry ? <>Manually entered: {fmtEuro(summary.netFinal)}</> : <>Auto-calculated from work log: {fmtEuro(summary.net)}</>}
         </p>
       </Card>
 
-      <Card className="mb-4">
+      <Card className="mb-4" accent={C.pink}>
         <div className="flex items-center gap-2 mb-2">
-          <Target size={16} className="text-emerald-400" />
-          <span className="text-sm font-medium text-zinc-200">Goal {fmtEuro(goal)}</span>
+          <Target size={15} style={{ color: C.pinkText }} />
+          <span className="text-sm font-extrabold" style={{ color: C.ink, fontFamily: FONT_DISPLAY }}>Goal {fmtEuro(goal)}</span>
         </div>
         <ProgressBar pct={pct} />
-        <div className="flex justify-between mt-2 text-xs text-zinc-500">
+        <div className="flex justify-between mt-2 text-[11px]" style={{ color: C.inkSoft }}>
           <span>{fmtEuro(summary.total)} / {fmtEuro(goal)}</span>
           <span>{Math.round(pct * 100)}%</span>
         </div>
         {remaining > 0 ? (
-          <p className="text-xs text-zinc-400 mt-2">
-            Need <span className="text-zinc-100 font-medium">{formatHM(hoursNeeded)}</span> more to reach the goal
+          <p className="text-xs mt-2" style={{ color: C.ink }}>
+            Need <span className="font-extrabold">{formatHM(hoursNeeded)}</span> more to reach the goal
           </p>
         ) : (
-          <p className="text-xs text-emerald-400 mt-2">Goal reached 🎉</p>
+          <p className="text-xs font-bold mt-2" style={{ color: C.sageText }}>Goal reached 🎉</p>
         )}
       </Card>
 
       <div className="grid grid-cols-2 gap-3 mb-5">
-        <button
-          onClick={onAddWork}
-          className="flex items-center justify-center gap-2 bg-emerald-400 text-zinc-950 font-medium rounded-2xl py-3"
-        >
-          <Plus size={18} /> Work Day
-        </button>
-        <button
-          onClick={onGoToTips}
-          className="flex items-center justify-center gap-2 bg-amber-400 text-zinc-950 font-medium rounded-2xl py-3"
-        >
-          <Coins size={18} /> Tips
-        </button>
+        <PillButton onClick={onAddWork} bg={C.pink} bgDeep={C.pinkDeep}>
+          <Plus size={17} /> Work Day
+        </PillButton>
+        <PillButton onClick={onGoToTips} bg={C.honey} bgDeep={C.honeyDeep} text={C.ink}>
+          <Coins size={17} /> Tips
+        </PillButton>
       </div>
 
-      <h3 className="text-sm font-semibold text-zinc-300 mb-2">Recent</h3>
+      <h3 className="text-sm font-extrabold mb-2 flex items-center gap-1.5" style={{ color: C.ink, fontFamily: FONT_DISPLAY }}>
+        <Clock size={14} style={{ color: C.pinkText }} /> Recent
+      </h3>
       <div className="flex flex-col gap-2">
-        {recent.length === 0 && <p className="text-sm text-zinc-500">Nothing logged yet this month.</p>}
+        {recent.length === 0 && <p className="text-sm" style={{ color: C.inkSoft }}>Nothing logged yet this month 🎀</p>}
         {recent.map((r) => (
           <WorkRow key={r.id} row={r} onEdit={onEditWork} onDelete={onDeleteWork} />
         ))}
@@ -757,77 +943,63 @@ function WorkRow({ row, onEdit, onDelete }) {
   return (
     <Card className="flex items-center justify-between">
       <button onClick={() => onEdit(row)} className="flex-1 text-left">
-        <p className="text-sm font-medium text-zinc-100">{shiftDayLabel(row.date)}</p>
-        <p className="text-xs text-zinc-500">{row.start}–{row.end} · {formatHM(row.hours)}</p>
+        <p className="text-sm font-extrabold" style={{ color: C.ink, fontFamily: FONT_DISPLAY }}>{shiftDayLabel(row.date)}</p>
+        <p className="text-xs" style={{ color: C.inkSoft }}>{row.start}–{row.end} · {formatHM(row.hours)}</p>
       </button>
       <div className="flex items-center gap-3">
-        <span className="font-mono text-emerald-400 text-sm tabular-nums">{fmtEuro(row.net)}</span>
+        <span className="font-extrabold text-sm tabular-nums" style={{ color: C.sageText }}>{fmtEuro(row.net)}</span>
         <button onClick={() => onEdit(row)}>
-          <Pencil size={15} className="text-zinc-600" />
+          <Pencil size={15} style={{ color: C.inkSoft }} />
         </button>
         <button onClick={() => onDelete(row.id)}>
-          <Trash2 size={15} className="text-zinc-600" />
+          <Trash2 size={15} style={{ color: C.inkSoft }} />
         </button>
       </div>
     </Card>
   );
 }
 
-// ---------- Work Log ----------
+/* ---------- Work Log ---------- */
 function WorkLog({ months, selectedMonth, setSelectedMonth, monthWorkDays, onEdit, onDelete }) {
   const sorted = [...monthWorkDays].sort((a, b) => b.date.localeCompare(a.date));
   const monthDaysCount = monthDays(selectedMonth);
   const firstDay = `${selectedMonth}-01`;
   const lastDay = `${selectedMonth}-${String(monthDaysCount).padStart(2, "0")}`;
-  
+
   const [startDate, setStartDate] = useState(firstDay);
   const [endDate, setEndDate] = useState(lastDay);
-  
+
   const filtered = sorted.filter((w) => w.date >= startDate && w.date <= endDate);
   const totalHours = filtered.reduce((s, d) => s + d.hours, 0);
   const workedDays = new Set(filtered.map((d) => d.date)).size;
-  
+
   return (
     <div>
       <MonthNav months={months} selected={selectedMonth} onChange={setSelectedMonth} />
-      
+
       <Card className="mb-4">
-        <p className="text-xs uppercase tracking-wide text-zinc-500 mb-3">Select Date Range</p>
+        <SectionTitle icon={Clock}>Select Date Range</SectionTitle>
         <div className="grid grid-cols-2 gap-2 mb-3">
           <Field label="Start Date">
-            <input 
-              type="date" 
-              value={startDate} 
-              onChange={(e) => setStartDate(e.target.value)}
-              min={firstDay}
-              max={lastDay}
-              className={inputClass}
-            />
+            <StyledInput type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)} min={firstDay} max={lastDay} />
           </Field>
           <Field label="End Date">
-            <input 
-              type="date" 
-              value={endDate} 
-              onChange={(e) => setEndDate(e.target.value)}
-              min={firstDay}
-              max={lastDay}
-              className={inputClass}
-            />
+            <StyledInput type="date" value={endDate} onChange={(e) => setEndDate(e.target.value)} min={firstDay} max={lastDay} />
           </Field>
         </div>
-        
+
         <div className="grid grid-cols-2 gap-3">
-          <Card>
-            <StatBlock label="Total Hours" value={formatHM(totalHours)} accent="text-emerald-400" />
+          <Card style={{ background: C.cardAlt }}>
+            <StatBlock label="Total Hours" value={formatHM(totalHours)} accent={C.sageText} />
           </Card>
-          <Card>
-            <StatBlock label="Worked Days" value={String(workedDays)} accent="text-sky-400" />
+          <Card style={{ background: C.cardAlt }}>
+            <StatBlock label="Worked Days" value={String(workedDays)} accent={C.blueText} />
           </Card>
         </div>
       </Card>
-      
+
       <div className="flex flex-col gap-2">
-        {filtered.length === 0 && <p className="text-sm text-zinc-500 text-center mt-6">No shifts in this date range.</p>}
+        {filtered.length === 0 && <p className="text-sm text-center mt-6" style={{ color: C.inkSoft }}>No shifts in this date range 🌸</p>}
         {filtered.map((r) => (
           <WorkRow key={r.id} row={r} onEdit={onEdit} onDelete={onDelete} />
         ))}
@@ -836,18 +1008,17 @@ function WorkLog({ months, selectedMonth, setSelectedMonth, monthWorkDays, onEdi
   );
 }
 
-// ---------- Tips ----------
+/* ---------- Tips ---------- */
 function TipsPage({ months, selectedMonth, setSelectedMonth, monthTips, onUpsert, tipRanges, onRangeChange }) {
   const total = monthTips.reduce((s, t) => s + t.amount, 0);
   return (
     <div>
       <MonthNav months={months} selected={selectedMonth} onChange={setSelectedMonth} />
-      <Card className="mb-4">
-        <StatBlock label="Tips this month" value={fmtEuro(total)} accent="text-amber-400" />
+      <Card className="mb-4" accent={C.honey}>
+        <StatBlock label="Tips this month" value={fmtEuro(total)} accent={C.honeyText} />
       </Card>
-      <p className="text-xs text-zinc-500 mb-3">
-        Tips are paid out 3 times a month. Defaults to days 1–10, 11–20, 21–end — tap the day numbers
-        below to adjust a range if a payout lands early or late.
+      <p className="text-xs mb-3" style={{ color: C.inkSoft }}>
+        Tips are paid out 3 times a month. Defaults to days 1–10, 11–20, 21–end — tap the day numbers below to adjust a range if a payout lands early or late.
       </p>
       <div className="flex flex-col gap-3">
         {TIP_PERIODS.map((period) => (
@@ -876,46 +1047,37 @@ function TipPeriodCard({ month, period, range, amount, onUpsert, onRangeChange }
     <Card>
       <div className="flex items-center justify-between mb-2">
         <div className="flex items-center gap-1.5">
-          <span className="text-sm font-medium text-zinc-200">Days</span>
+          <span className="text-sm font-extrabold" style={{ color: C.ink, fontFamily: FONT_DISPLAY }}>Days</span>
           <input
-            type="number"
-            min={1}
-            max={31}
-            value={range.start}
+            type="number" min={1} max={31} value={range.start}
             onChange={(e) => onRangeChange(period, "start", e.target.value)}
-            className="w-11 bg-zinc-800 border border-zinc-700 rounded-lg px-1.5 py-1 text-center text-xs font-mono text-zinc-50 focus:outline-none focus:ring-1 focus:ring-emerald-400/60"
+            className="w-11 rounded-lg px-1.5 py-1 text-center text-xs font-bold focus:outline-none"
+            style={{ background: C.cardAlt, border: `1.5px solid ${C.line}`, color: C.ink }}
           />
-          <span className="text-zinc-500">–</span>
+          <span style={{ color: C.inkSoft }}>–</span>
           <input
-            type="number"
-            min={1}
-            max={31}
-            value={range.end}
+            type="number" min={1} max={31} value={range.end}
             onChange={(e) => onRangeChange(period, "end", e.target.value)}
-            className="w-11 bg-zinc-800 border border-zinc-700 rounded-lg px-1.5 py-1 text-center text-xs font-mono text-zinc-50 focus:outline-none focus:ring-1 focus:ring-emerald-400/60"
+            className="w-11 rounded-lg px-1.5 py-1 text-center text-xs font-bold focus:outline-none"
+            style={{ background: C.cardAlt, border: `1.5px solid ${C.line}`, color: C.ink }}
           />
         </div>
-        <Coins size={15} className="text-amber-400" />
+        <Coins size={15} style={{ color: C.honeyText }} />
       </div>
       <div className="flex items-center gap-2 mt-1">
-        <span className="text-zinc-500">€</span>
+        <span style={{ color: C.inkSoft }}>€</span>
         <input
-          type="number"
-          step="0.01"
-          placeholder="0.00"
-          value={value}
-          onChange={(e) => {
-            setValue(e.target.value);
-            onUpsert(month, period, e.target.value);
-          }}
-          className="w-full bg-transparent text-lg font-mono tabular-nums text-amber-400 focus:outline-none"
+          type="number" step="0.01" placeholder="0.00" value={value}
+          onChange={(e) => { setValue(e.target.value); onUpsert(month, period, e.target.value); }}
+          className="w-full bg-transparent text-lg font-extrabold tabular-nums focus:outline-none"
+          style={{ color: C.honeyText, fontFamily: FONT_DISPLAY }}
         />
       </div>
     </Card>
   );
 }
 
-// ---------- Stats ----------
+/* ---------- Stats ---------- */
 function StatsPage({ statsSub, setStatsSub, months, selectedMonth, setSelectedMonth, workDays, tips, settings, manualNetSalaries, tipPeriodRanges }) {
   const monthWorkDays = workDays.filter((w) => monthKey(w.date) === selectedMonth);
   const monthTips = tips.filter((t) => t.month === selectedMonth);
@@ -953,7 +1115,6 @@ function StatsPage({ statsSub, setStatsSub, months, selectedMonth, setSelectedMo
   const remaining = Math.max(goal - total, 0);
   const hoursNeeded = avgIncomePerHour > 0 ? remaining / avgIncomePerHour : 0;
 
-  // charts
   const hoursByWeekday = WEEKDAYS.map((label, idx) => {
     const h = monthWorkDays.filter((d) => weekdayIdx(d.date) === idx).reduce((s, d) => s + d.hours, 0);
     return { day: label, hours: Math.round(h * 100) / 100 };
@@ -965,12 +1126,7 @@ function StatsPage({ statsSub, setStatsSub, months, selectedMonth, setSelectedMo
     const tipAmt = monthTips.find((t) => t.period === period)?.amount || 0;
     return { period: tipRangeLabel(tipRanges, period), income: Math.round((workNet + tipAmt) * 100) / 100 };
   });
-  const tipTrend = TIP_PERIODS.map((period) => ({
-    period: tipRangeLabel(tipRanges, period),
-    tip: monthTips.find((t) => t.period === period)?.amount || 0,
-  }));
 
-  // calendar
   const firstWeekday = monthFirstWeekday(selectedMonth);
   const daysCount = monthDays(selectedMonth);
   const today = todayStr();
@@ -980,14 +1136,13 @@ function StatsPage({ statsSub, setStatsSub, months, selectedMonth, setSelectedMo
     const dateStr = `${selectedMonth}-${String(d).padStart(2, "0")}`;
     const hrs = monthWorkDays.filter((w) => w.date === dateStr).reduce((s, w) => s + w.hours, 0);
     const netDay = monthWorkDays.filter((w) => w.date === dateStr).reduce((s, w) => s + w.net, 0);
-    let color = "bg-zinc-800 text-zinc-500";
-    if (hrs >= 6) color = "bg-emerald-400/20 text-emerald-300 border border-emerald-400/40";
-    else if (hrs > 0) color = "bg-amber-400/20 text-amber-300 border border-amber-400/40";
-    else if (dateStr <= today) color = "bg-red-500/10 text-red-400/70 border border-red-500/20";
-    cells.push({ day: d, hrs, netDay, color });
+    let bg = C.cardAlt, fg = C.inkSoft, border = C.line;
+    if (hrs >= 6) { bg = `${C.sage}33`; fg = C.sageText; border = `${C.sage}88`; }
+    else if (hrs > 0) { bg = `${C.honey}33`; fg = C.honeyText; border = `${C.honey}99`; }
+    else if (dateStr <= today) { bg = `${C.red}22`; fg = C.redDeep; border = `${C.red}55`; }
+    cells.push({ day: d, hrs, netDay, bg, fg, border });
   }
 
-  // history: all months
   const allMonths = Array.from(new Set([...workDays.map((w) => monthKey(w.date)), ...tips.map((t) => t.month)])).sort();
   const yearOf = selectedMonth.slice(0, 4);
   const yearMonths = allMonths.filter((m) => m.startsWith(yearOf));
@@ -1015,9 +1170,12 @@ function StatsPage({ statsSub, setStatsSub, months, selectedMonth, setSelectedMo
           <button
             key={s.id}
             onClick={() => setStatsSub(s.id)}
-            className={`px-3 py-1.5 rounded-full text-xs whitespace-nowrap border ${
-              statsSub === s.id ? "bg-emerald-400 text-zinc-950 border-emerald-400" : "bg-zinc-900 text-zinc-400 border-zinc-800"
-            }`}
+            className="px-3 py-1.5 rounded-full text-xs whitespace-nowrap font-bold"
+            style={
+              statsSub === s.id
+                ? { background: C.pink, color: C.white, border: `2px solid ${C.pink}` }
+                : { background: C.card, color: C.inkSoft, border: `2px solid ${C.line}` }
+            }
           >
             {s.label}
           </button>
@@ -1027,18 +1185,18 @@ function StatsPage({ statsSub, setStatsSub, months, selectedMonth, setSelectedMo
       {statsSub === "overview" && (
         <div className="flex flex-col gap-3">
           <Card>
-            <p className="text-xs uppercase tracking-wide text-zinc-500 mb-2">Salary Overview</p>
+            <SectionTitle icon={Sparkles}>Salary Overview</SectionTitle>
             <div className="grid grid-cols-2 gap-3">
-              <StatBlock label="Gross Salary" value={fmtEuro(gross)} accent="text-sky-400" />
-              <StatBlock label="Net (auto)" value={fmtEuro(net)} accent="text-emerald-400" sub="after pension" />
-              <StatBlock label={hasManualEntry ? "Net (manual)" : "Net (final)"} value={fmtEuro(netFinal)} accent="text-emerald-400" sub={hasManualEntry ? "after all taxes" : undefined} />
-              <StatBlock label="Tips" value={fmtEuro(tipsSum)} accent="text-amber-400" />
+              <StatBlock label="Gross Salary" value={fmtEuro(gross)} accent={C.blueText} />
+              <StatBlock label="Net (auto)" value={fmtEuro(net)} accent={C.sageText} sub="after pension" />
+              <StatBlock label={hasManualEntry ? "Net (manual)" : "Net (final)"} value={fmtEuro(netFinal)} accent={C.sageText} sub={hasManualEntry ? "after all taxes" : undefined} />
+              <StatBlock label="Tips" value={fmtEuro(tipsSum)} accent={C.honeyText} />
               <StatBlock label="Total Income" value={fmtEuro(total)} />
             </div>
           </Card>
 
           <Card>
-            <p className="text-xs uppercase tracking-wide text-zinc-500 mb-2">Working Hours</p>
+            <SectionTitle icon={Clock}>Working Hours</SectionTitle>
             <div className="grid grid-cols-2 gap-3">
               <StatBlock label="Total Hours" value={formatHM(totalHours)} />
               <StatBlock label="Worked Days" value={String(workedDaysCount)} />
@@ -1048,18 +1206,18 @@ function StatsPage({ statsSub, setStatsSub, months, selectedMonth, setSelectedMo
           </Card>
 
           <Card>
-            <p className="text-xs uppercase tracking-wide text-zinc-500 mb-2">Earnings per Hour</p>
+            <SectionTitle icon={Coins}>Earnings per Hour</SectionTitle>
             <div className="grid grid-cols-2 gap-3">
               <StatBlock label="Hourly Wage" value={fmtEuro(getRateForDate(settings.rateHistory, selectedMonth + "-01"))} />
-              <StatBlock label="Avg Net / Hour" value={fmtEuro(avgNetPerHour)} accent="text-emerald-400" />
-              <StatBlock label="Avg Tip / Hour" value={fmtEuro(avgTipPerHour)} accent="text-amber-400" />
+              <StatBlock label="Avg Net / Hour" value={fmtEuro(avgNetPerHour)} accent={C.sageText} />
+              <StatBlock label="Avg Tip / Hour" value={fmtEuro(avgTipPerHour)} accent={C.honeyText} />
               <StatBlock label="Avg Income / Hour" value={fmtEuro(avgIncomePerHour)} />
             </div>
-            <p className="text-xs text-zinc-500 mt-2">What you actually take home per hour worked, wage + tips combined.</p>
+            <p className="text-[11px] mt-2" style={{ color: C.inkSoft }}>What you actually take home per hour worked, wage + tips combined.</p>
           </Card>
 
           <Card>
-            <p className="text-xs uppercase tracking-wide text-zinc-500 mb-2">Shift Statistics</p>
+            <SectionTitle icon={Clock}>Shift Statistics</SectionTitle>
             <div className="grid grid-cols-2 gap-3">
               <StatBlock label="Longest Shift" value={formatHM(longest)} sub={longestDay ? shiftDayLabel(longestDay.date) : "—"} />
               <StatBlock label="Shortest Shift" value={formatHM(shortest)} sub={shortestDay ? shiftDayLabel(shortestDay.date) : "—"} />
@@ -1068,29 +1226,28 @@ function StatsPage({ statsSub, setStatsSub, months, selectedMonth, setSelectedMo
           </Card>
 
           <Card>
-            <p className="text-xs uppercase tracking-wide text-zinc-500 mb-2">Tips</p>
+            <SectionTitle icon={Coins}>Tips</SectionTitle>
             <div className="grid grid-cols-2 gap-3">
-              <StatBlock label="Total Tips" value={fmtEuro(tipsSum)} accent="text-amber-400" />
-              <StatBlock label="Highest Tip" value={fmtEuro(highestTip)} accent="text-amber-400" />
+              <StatBlock label="Total Tips" value={fmtEuro(tipsSum)} accent={C.honeyText} />
+              <StatBlock label="Highest Tip" value={fmtEuro(highestTip)} accent={C.honeyText} />
               <StatBlock label="Avg / Period" value={fmtEuro(avgTipPerPeriod)} />
               <StatBlock label="Avg / Hour" value={fmtEuro(avgTipPerHour)} />
             </div>
           </Card>
 
-          <Card>
+          <Card accent={C.pink}>
             <div className="flex items-center gap-2 mb-2">
-              <Target size={16} className="text-emerald-400" />
-              <span className="text-sm font-medium text-zinc-200">Monthly Goal {fmtEuro(goal)}</span>
+              <Target size={15} style={{ color: C.pinkText }} />
+              <span className="text-sm font-extrabold" style={{ color: C.ink, fontFamily: FONT_DISPLAY }}>Monthly Goal {fmtEuro(goal)}</span>
             </div>
             <ProgressBar pct={pct} />
-            <p className="text-xs text-zinc-500 mt-2">{Math.round(pct * 100)}%</p>
+            <p className="text-[11px] mt-2" style={{ color: C.inkSoft }}>{Math.round(pct * 100)}%</p>
             {remaining > 0 ? (
-              <p className="text-xs text-zinc-400 mt-1">
-                Remaining <span className="text-zinc-100">{fmtEuro(remaining)}</span> · Need{" "}
-                <span className="text-zinc-100">{formatHM(hoursNeeded)}</span>
+              <p className="text-xs mt-1" style={{ color: C.ink }}>
+                Remaining <span className="font-extrabold">{fmtEuro(remaining)}</span> · Need <span className="font-extrabold">{formatHM(hoursNeeded)}</span>
               </p>
             ) : (
-              <p className="text-xs text-emerald-400 mt-1">Goal reached 🎉</p>
+              <p className="text-xs font-bold mt-1" style={{ color: C.sageText }}>Goal reached 🎉</p>
             )}
           </Card>
         </div>
@@ -1100,25 +1257,25 @@ function StatsPage({ statsSub, setStatsSub, months, selectedMonth, setSelectedMo
         <Card>
           <div className="grid grid-cols-7 gap-1 mb-2 text-center">
             {WEEKDAYS.map((w) => (
-              <span key={w} className="text-[10px] text-zinc-500">{w[0]}</span>
+              <span key={w} className="text-[10px] font-bold" style={{ color: C.inkSoft }}>{w[0]}</span>
             ))}
           </div>
           <div className="grid grid-cols-7 gap-1">
             {cells.map((c, i) =>
               c ? (
-                <div key={i} className={`rounded-lg py-1.5 flex flex-col items-center ${c.color}`}>
-                  <span className="text-xs font-medium">{c.day}</span>
-                  {c.hrs > 0 && <span className="text-[9px] font-mono">{fmtEuro(c.netDay)}</span>}
+                <div key={i} className="rounded-xl py-1.5 flex flex-col items-center" style={{ background: c.bg, border: `1.5px solid ${c.border}` }}>
+                  <span className="text-xs font-bold" style={{ color: c.fg }}>{c.day}</span>
+                  {c.hrs > 0 && <span className="text-[8px] font-mono" style={{ color: c.fg }}>{fmtEuro(c.netDay)}</span>}
                 </div>
               ) : (
                 <div key={i} />
               )
             )}
           </div>
-          <div className="flex gap-3 mt-3 text-[10px] text-zinc-500">
-            <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded-full bg-emerald-400/40 inline-block" /> Long shift</span>
-            <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded-full bg-amber-400/40 inline-block" /> Normal</span>
-            <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded-full bg-red-500/20 inline-block" /> No work</span>
+          <div className="flex gap-3 mt-3 text-[10px]" style={{ color: C.inkSoft }}>
+            <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded-full inline-block" style={{ background: `${C.sage}88` }} /> Long shift</span>
+            <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded-full inline-block" style={{ background: `${C.honey}88` }} /> Normal</span>
+            <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded-full inline-block" style={{ background: `${C.red}55` }} /> No work</span>
           </div>
         </Card>
       )}
@@ -1126,26 +1283,26 @@ function StatsPage({ statsSub, setStatsSub, months, selectedMonth, setSelectedMo
       {statsSub === "charts" && (
         <div className="flex flex-col gap-4">
           <Card>
-            <p className="text-xs uppercase tracking-wide text-zinc-500 mb-2">Hours by Weekday</p>
+            <SectionTitle icon={BarChart3}>Hours by Weekday</SectionTitle>
             <ResponsiveContainer width="100%" height={180}>
               <BarChart data={hoursByWeekday}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#27272a" vertical={false} />
-                <XAxis dataKey="day" tick={{ fill: "#71717a", fontSize: 11 }} axisLine={false} tickLine={false} />
-                <YAxis tick={{ fill: "#71717a", fontSize: 11 }} axisLine={false} tickLine={false} />
-                <Tooltip contentStyle={{ background: "#18181b", border: "1px solid #3f3f46", borderRadius: 8 }} labelStyle={{ color: "#e4e4e7" }} />
-                <Bar dataKey="hours" fill="#34d399" radius={[6, 6, 0, 0]} />
+                <CartesianGrid strokeDasharray="3 3" stroke={C.line} vertical={false} />
+                <XAxis dataKey="day" tick={{ fill: C.inkSoft, fontSize: 11 }} axisLine={false} tickLine={false} />
+                <YAxis tick={{ fill: C.inkSoft, fontSize: 11 }} axisLine={false} tickLine={false} />
+                <Tooltip contentStyle={{ background: C.card, border: `2px solid ${C.line}`, borderRadius: 12 }} labelStyle={{ color: C.ink }} />
+                <Bar dataKey="hours" fill={C.pink} radius={[8, 8, 0, 0]} />
               </BarChart>
             </ResponsiveContainer>
           </Card>
           <Card>
-            <p className="text-xs uppercase tracking-wide text-zinc-500 mb-2">Income by Pay Period</p>
+            <SectionTitle icon={Coins}>Income by Pay Period</SectionTitle>
             <ResponsiveContainer width="100%" height={180}>
               <BarChart data={incomeByPeriod}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#27272a" vertical={false} />
-                <XAxis dataKey="period" tick={{ fill: "#71717a", fontSize: 11 }} axisLine={false} tickLine={false} />
-                <YAxis tick={{ fill: "#71717a", fontSize: 11 }} axisLine={false} tickLine={false} />
-                <Tooltip contentStyle={{ background: "#18181b", border: "1px solid #3f3f46", borderRadius: 8 }} labelStyle={{ color: "#e4e4e7" }} />
-                <Bar dataKey="income" fill="#38bdf8" radius={[6, 6, 0, 0]} />
+                <CartesianGrid strokeDasharray="3 3" stroke={C.line} vertical={false} />
+                <XAxis dataKey="period" tick={{ fill: C.inkSoft, fontSize: 11 }} axisLine={false} tickLine={false} />
+                <YAxis tick={{ fill: C.inkSoft, fontSize: 11 }} axisLine={false} tickLine={false} />
+                <Tooltip contentStyle={{ background: C.card, border: `2px solid ${C.line}`, borderRadius: 12 }} labelStyle={{ color: C.ink }} />
+                <Bar dataKey="income" fill={C.blue} radius={[8, 8, 0, 0]} />
               </BarChart>
             </ResponsiveContainer>
           </Card>
@@ -1154,29 +1311,29 @@ function StatsPage({ statsSub, setStatsSub, months, selectedMonth, setSelectedMo
 
       {statsSub === "history" && (
         <div className="flex flex-col gap-2">
-          {allMonths.length === 0 && <p className="text-sm text-zinc-500 text-center mt-6">No history yet.</p>}
+          {allMonths.length === 0 && <p className="text-sm text-center mt-6" style={{ color: C.inkSoft }}>No history yet 🌸</p>}
           {allMonths.slice().reverse().map((m) => {
             const mDays = workDays.filter((w) => monthKey(w.date) === m);
             const mh = mDays.reduce((s, w) => s + w.hours, 0);
             const mn = mDays.reduce((s, w) => s + w.net, 0);
-            const mTax = manualTaxes[m] || 0;
-            const mnAfterTax = mn - mTax;
+            const manualNet = manualNetSalaries[m];
+            const mnAfterTax = typeof manualNet === "number" ? manualNet : mn;
             return (
               <Card key={m} className="flex items-center justify-between">
-                <span className="text-sm font-medium text-zinc-200">{monthLabel(m)}</span>
+                <span className="text-sm font-extrabold" style={{ color: C.ink, fontFamily: FONT_DISPLAY }}>{monthLabel(m)}</span>
                 <div className="flex gap-4 text-right">
                   <StatBlock label="Hours" value={formatHM(mh)} />
-                  <StatBlock label="Net" value={fmtEuro(mnAfterTax)} accent="text-emerald-400" />
+                  <StatBlock label="Net" value={fmtEuro(mnAfterTax)} accent={C.sageText} />
                 </div>
               </Card>
             );
           })}
-          <Card className="mt-2">
-            <p className="text-xs uppercase tracking-wide text-zinc-500 mb-2">{yearOf} Total</p>
+          <Card className="mt-2" accent={C.lavender}>
+            <SectionTitle icon={Sparkles} color={C.lavenderDeep}>{yearOf} Total</SectionTitle>
             <div className="grid grid-cols-2 gap-3">
               <StatBlock label="Hours" value={formatHM(yearHours)} />
-              <StatBlock label="Net Salary" value={fmtEuro(yearNet)} accent="text-emerald-400" />
-              <StatBlock label="Tips" value={fmtEuro(yearTips)} accent="text-amber-400" />
+              <StatBlock label="Net Salary" value={fmtEuro(yearNet)} accent={C.sageText} />
+              <StatBlock label="Tips" value={fmtEuro(yearTips)} accent={C.honeyText} />
               <StatBlock label="Grand Total" value={fmtEuro(yearNet + yearTips)} />
             </div>
           </Card>
@@ -1186,7 +1343,7 @@ function StatsPage({ statsSub, setStatsSub, months, selectedMonth, setSelectedMo
   );
 }
 
-// ---------- Prediction ----------
+/* ---------- Prediction ---------- */
 function PredictionPage({ settings, summary, monthWorkDays, selectedMonth, futureShifts, onAdd, onRemove, avgIncomePerHour }) {
   const [date, setDate] = useState(todayStr());
   const [start, setStart] = useState("17:00");
@@ -1204,39 +1361,31 @@ function PredictionPage({ settings, summary, monthWorkDays, selectedMonth, futur
   const estimatedTips = tipRatePerHour * addedHours;
 
   const projHours = summary.totalHours + addedHours;
-  const projNet = summary.net + addedNet; // before tax — tax isn't predicted, enter it once you know it
-  const projTips = summary.tipsSum + estimatedTips;
-  const projTotal = projNet - summary.manualTax + projTips; // only the tax you've already entered is applied
+  const projTipsTotal = summary.tipsSum + estimatedTips;
+  const projectedTotal = summary.total + addedNet + estimatedTips;
 
   return (
     <div>
       <Card className="mb-4">
-        <p className="text-xs uppercase tracking-wide text-zinc-500 mb-2">Current — {monthLabel(selectedMonth)}</p>
+        <SectionTitle icon={Sparkles}>Current — {monthLabel(selectedMonth)}</SectionTitle>
         <div className="grid grid-cols-2 gap-3">
-          <StatBlock label="Net (after your tax)" value={fmtEuro(summary.netFinal)} accent="text-emerald-400" />
+          <StatBlock label="Net (after your tax)" value={fmtEuro(summary.netFinal)} accent={C.sageText} />
           <StatBlock label="Hours" value={summary.totalHours.toFixed(2)} />
         </div>
       </Card>
 
       <Card className="mb-4">
-        <p className="text-sm font-medium text-zinc-200 mb-3">Add a Future Shift</p>
+        <SectionTitle icon={Plus}>Add a Future Shift</SectionTitle>
         <Field label="Date">
-          <input type="date" value={date} onChange={(e) => setDate(e.target.value)} className={inputClass} />
+          <StyledInput type="date" value={date} onChange={(e) => setDate(e.target.value)} />
         </Field>
         <div className="grid grid-cols-2 gap-2">
-          <Field label="Start">
-            <input type="time" value={start} onChange={(e) => setStart(e.target.value)} className={inputClass} />
-          </Field>
-          <Field label="End">
-            <input type="time" value={end} onChange={(e) => setEnd(e.target.value)} className={inputClass} />
-          </Field>
+          <Field label="Start"><StyledInput type="time" value={start} onChange={(e) => setStart(e.target.value)} /></Field>
+          <Field label="End"><StyledInput type="time" value={end} onChange={(e) => setEnd(e.target.value)} /></Field>
         </div>
-        <button
-          onClick={() => onAdd({ date, start, end })}
-          className="w-full mt-1 flex items-center justify-center gap-2 bg-sky-400 text-zinc-950 font-medium rounded-xl py-2.5"
-        >
+        <PillButton onClick={() => onAdd({ date, start, end })} bg={C.blue} bgDeep={C.blueDeep} className="mt-1">
           <Plus size={16} /> Add Shift
-        </button>
+        </PillButton>
       </Card>
 
       {futureShifts.length > 0 && (
@@ -1244,35 +1393,35 @@ function PredictionPage({ settings, summary, monthWorkDays, selectedMonth, futur
           {futureShifts.map((f) => (
             <Card key={f.id} className="flex items-center justify-between">
               <div>
-                <p className="text-sm font-medium text-zinc-100">{shiftDayLabel(f.date)}</p>
-                <p className="text-xs text-zinc-500">{f.start}–{f.end} · {formatHM(calcHoursDecimal(f.start, f.end, 0))}</p>
+                <p className="text-sm font-extrabold" style={{ color: C.ink, fontFamily: FONT_DISPLAY }}>{shiftDayLabel(f.date)}</p>
+                <p className="text-xs" style={{ color: C.inkSoft }}>{f.start}–{f.end} · {formatHM(calcHoursDecimal(f.start, f.end, 0))}</p>
               </div>
               <button onClick={() => onRemove(f.id)}>
-                <Trash2 size={15} className="text-zinc-600" />
+                <Trash2 size={15} style={{ color: C.inkSoft }} />
               </button>
             </Card>
           ))}
         </div>
       )}
 
-      <Card>
-        <p className="text-xs uppercase tracking-wide text-zinc-500 mb-2">End of {monthLabel(selectedMonth).split(" ")[0]}, Projected</p>
+      <Card accent={C.lavender}>
+        <SectionTitle icon={TrendingUp} color={C.lavenderDeep}>End of {monthLabel(selectedMonth).split(" ")[0]}, Projected</SectionTitle>
         <div className="grid grid-cols-2 gap-3">
-          <StatBlock label="Hours" value={projHours.toFixed(1)} />
-          <StatBlock label="Net (before tax)" value={fmtEuro(projNet)} accent="text-emerald-400" />
-          <StatBlock label="Tips (estimated)" value={fmtEuro(projTips)} accent="text-amber-400" />
-          <StatBlock label="Total so far" value={fmtEuro(projTotal)} />
+          <StatBlock label="Projected Hours" value={projHours.toFixed(1)} sub={addedHours > 0 ? `+${formatHM(addedHours)} planned` : undefined} />
+          <StatBlock label="Extra Net Expected" value={fmtEuro(addedNet)} accent={C.blueText} sub="from planned shifts" />
+          <StatBlock label="Tips (estimated)" value={fmtEuro(projTipsTotal)} accent={C.honeyText} />
+          <StatBlock label="Projected Total" value={fmtEuro(projectedTotal)} accent={C.sageText} />
         </div>
-        <p className="text-xs text-zinc-500 mt-2">
-          Tips are estimated from your average tip rate of {fmtEuro(tipRatePerHour)}/hour so far this month.
-          This projection uses your manually entered net salary from the Dashboard (if any) or auto-calculates from work hours.
+        <p className="text-[11px] mt-2" style={{ color: C.inkSoft }}>
+          Projected Total = what you've earned so far this month ({fmtEuro(summary.total)}) + extra net from planned shifts + estimated
+          tips, using your average tip rate of {fmtEuro(tipRatePerHour)}/hour so far.
         </p>
       </Card>
     </div>
   );
 }
 
-// ---------- Settings ----------
+/* ---------- Settings ---------- */
 function SettingsPage({ settings, onSave }) {
   const [form, setForm] = useState(settings);
   const [saved, setSaved] = useState(false);
@@ -1294,116 +1443,81 @@ function SettingsPage({ settings, onSave }) {
     setNewRateValue("");
   }
   function removeRate(date) {
-    if (form.rateHistory.length <= 1) return; // always keep at least one
+    if (form.rateHistory.length <= 1) return;
     update("rateHistory", form.rateHistory.filter((r) => r.date !== date));
   }
 
   return (
     <div>
       <Card className="mb-4">
-        <p className="text-sm font-medium text-zinc-200 mb-1">Pay Rates</p>
-        <p className="text-xs text-zinc-500 mb-3">
-          Add a new row whenever your hourly rate changes. Each shift uses whichever rate was
-          effective on its own date.
+        <SectionTitle icon={Coins}>Pay Rates</SectionTitle>
+        <p className="text-xs mb-3" style={{ color: C.inkSoft }}>
+          Add a new row whenever your hourly rate changes. Each shift uses whichever rate was effective on its own date.
         </p>
 
         <div className="flex flex-col gap-2 mb-3">
           {sortedRates.map((r) => (
-            <div key={r.date} className="flex items-center justify-between bg-zinc-800/60 rounded-xl px-3 py-2">
+            <div key={r.date} className="flex items-center justify-between rounded-2xl px-3 py-2" style={{ background: C.cardAlt, border: `1.5px solid ${C.line}` }}>
               <div>
-                <p className="text-sm text-zinc-100 font-mono">{fmtEuro(r.rate)}/h</p>
-                <p className="text-[11px] text-zinc-500">from {r.date}</p>
+                <p className="text-sm font-extrabold" style={{ color: C.ink, fontFamily: FONT_DISPLAY }}>{fmtEuro(r.rate)}/h</p>
+                <p className="text-[11px]" style={{ color: C.inkSoft }}>from {r.date}</p>
               </div>
               <button onClick={() => removeRate(r.date)} disabled={form.rateHistory.length <= 1}>
-                <Trash2 size={15} className={form.rateHistory.length <= 1 ? "text-zinc-700" : "text-zinc-500"} />
+                <Trash2 size={15} style={{ color: form.rateHistory.length <= 1 ? `${C.inkSoft}55` : C.inkSoft }} />
               </button>
             </div>
           ))}
         </div>
 
         <div className="grid grid-cols-2 gap-2 mb-2">
-          <Field label="Effective from">
-            <input type="date" value={newRateDate} onChange={(e) => setNewRateDate(e.target.value)} className={inputClass} />
-          </Field>
+          <Field label="Effective from"><StyledInput type="date" value={newRateDate} onChange={(e) => setNewRateDate(e.target.value)} /></Field>
           <Field label="New rate (€/h)">
-            <input
-              type="number"
-              step="0.01"
-              value={newRateValue}
-              onChange={(e) => setNewRateValue(e.target.value)}
-              placeholder="14.99"
-              className={inputClass}
-            />
+            <StyledInput type="number" step="0.01" value={newRateValue} onChange={(e) => setNewRateValue(e.target.value)} placeholder="14.99" />
           </Field>
         </div>
-        <button onClick={addRate} className="w-full flex items-center justify-center gap-2 bg-sky-400 text-zinc-950 font-medium rounded-xl py-2">
+        <PillButton onClick={addRate} bg={C.blue} bgDeep={C.blueDeep} className="py-2">
           <Plus size={16} /> Add Rate Change
-        </button>
+        </PillButton>
       </Card>
 
       <Card className="mb-4">
-        <p className="text-sm font-medium text-zinc-200 mb-3">Pay Rules</p>
-        <Field label="Vakantieuren (%)">
-          <input type="number" step="0.01" value={form.vakantieurenPct} onChange={(e) => update("vakantieurenPct", Number(e.target.value))} className={inputClass} />
-        </Field>
-        <Field label="Vakantiegeld (%)">
-          <input type="number" step="0.01" value={form.vakantiegeldPct} onChange={(e) => update("vakantiegeldPct", Number(e.target.value))} className={inputClass} />
-        </Field>
+        <SectionTitle icon={SettingsIcon}>Pay Rules</SectionTitle>
+        <Field label="Vakantieuren (%)"><StyledInput type="number" step="0.01" value={form.vakantieurenPct} onChange={(e) => update("vakantieurenPct", Number(e.target.value))} /></Field>
+        <Field label="Vakantiegeld (%)"><StyledInput type="number" step="0.01" value={form.vakantiegeldPct} onChange={(e) => update("vakantiegeldPct", Number(e.target.value))} /></Field>
       </Card>
 
       <Card className="mb-4">
-        <p className="text-sm font-medium text-zinc-200 mb-1">Pension &amp; Deductions</p>
-        <p className="text-xs text-zinc-500 mb-3">
-          The four rates below are applied to the pension basis, not directly to gross pay.
-        </p>
-        <Field label="Pension basis (% of gross)">
-          <input type="number" step="0.01" value={form.pensionBasisPct} onChange={(e) => update("pensionBasisPct", Number(e.target.value))} className={inputClass} />
-        </Field>
+        <SectionTitle icon={Sparkles}>Pension &amp; Deductions</SectionTitle>
+        <p className="text-xs mb-3" style={{ color: C.inkSoft }}>The four rates below are applied to the pension basis, not directly to gross pay.</p>
+        <Field label="Pension basis (% of gross)"><StyledInput type="number" step="0.01" value={form.pensionBasisPct} onChange={(e) => update("pensionBasisPct", Number(e.target.value))} /></Field>
         <div className="grid grid-cols-2 gap-2">
-          <Field label="Ouderdomspensioen (%)">
-            <input type="number" step="0.01" value={form.ouderdomspensioenPct} onChange={(e) => update("ouderdomspensioenPct", Number(e.target.value))} className={inputClass} />
-          </Field>
-          <Field label="Nabestaandenpensioen (%)">
-            <input type="number" step="0.01" value={form.nabestaandenpensioenPct} onChange={(e) => update("nabestaandenpensioenPct", Number(e.target.value))} className={inputClass} />
-          </Field>
-          <Field label="W.G.A. (%)">
-            <input type="number" step="0.01" value={form.wgaPct} onChange={(e) => update("wgaPct", Number(e.target.value))} className={inputClass} />
-          </Field>
-          <Field label="Premie HOP (%)">
-            <input type="number" step="0.01" value={form.premieHopPct} onChange={(e) => update("premieHopPct", Number(e.target.value))} className={inputClass} />
-          </Field>
+          <Field label="Ouderdomspensioen (%)"><StyledInput type="number" step="0.01" value={form.ouderdomspensioenPct} onChange={(e) => update("ouderdomspensioenPct", Number(e.target.value))} /></Field>
+          <Field label="Nabestaandenpensioen (%)"><StyledInput type="number" step="0.01" value={form.nabestaandenpensioenPct} onChange={(e) => update("nabestaandenpensioenPct", Number(e.target.value))} /></Field>
+          <Field label="W.G.A. (%)"><StyledInput type="number" step="0.01" value={form.wgaPct} onChange={(e) => update("wgaPct", Number(e.target.value))} /></Field>
+          <Field label="Premie HOP (%)"><StyledInput type="number" step="0.01" value={form.premieHopPct} onChange={(e) => update("premieHopPct", Number(e.target.value))} /></Field>
         </div>
       </Card>
 
       <Card className="mb-4">
-        <p className="text-sm font-medium text-zinc-200 mb-3">Goal</p>
-        <Field label="Monthly goal (€)">
-          <input type="number" step="1" value={form.monthlyGoal} onChange={(e) => update("monthlyGoal", Number(e.target.value))} className={inputClass} />
-        </Field>
+        <SectionTitle icon={Target}>Goal</SectionTitle>
+        <Field label="Monthly goal (€)"><StyledInput type="number" step="1" value={form.monthlyGoal} onChange={(e) => update("monthlyGoal", Number(e.target.value))} /></Field>
       </Card>
 
-      <button
-        onClick={() => {
-          onSave(form);
-          setSaved(true);
-        }}
-        className="w-full bg-emerald-400 text-zinc-950 font-medium rounded-2xl py-3"
-      >
+      <PillButton onClick={() => { onSave(form); setSaved(true); }} bg={C.pink} bgDeep={C.pinkDeep} className="w-full">
         {saved ? "Saved ✓" : "Save Settings"}
-      </button>
+      </PillButton>
 
-      <p className="text-xs text-zinc-500 mt-4 leading-relaxed">
-        Gross pay = hours × the rate effective on that date, plus vakantieuren and vakantiegeld
-        (both calculated on the base wage). The pension basis is a percentage of that gross, and
-        Ouderdomspensioen, Nabestaandenpensioen, W.G.A. and Premie HOP are each deducted from that
-        basis. Income tax isn't calculated automatically — enter your own on the Dashboard once
-        you've worked it out. Tips are added on top of everything and are never taxed.
+      <p className="text-xs mt-4 leading-relaxed" style={{ color: C.inkSoft }}>
+        Gross pay = hours × the rate effective on that date, plus vakantieuren and vakantiegeld (both calculated on the base wage).
+        The pension basis is a percentage of that gross, and Ouderdomspensioen, Nabestaandenpensioen, W.G.A. and Premie HOP are each
+        deducted from that basis. Income tax isn't calculated automatically — enter your own on the Dashboard once you've worked it
+        out. Tips are added on top of everything and are never taxed.
       </p>
     </div>
   );
 }
 
-// ---------- Modals ----------
+/* ---------- Modals ---------- */
 function AddWorkModal({ settings, onClose, onSave }) {
   const [date, setDate] = useState(todayStr());
   const [start, setStart] = useState("17:00");
@@ -1415,44 +1529,33 @@ function AddWorkModal({ settings, onClose, onSave }) {
   const { gross, net } = calcPay(hours, rate, settings);
 
   return (
-    <Modal title="Add Work Day" onClose={onClose}>
-      <Field label="Date">
-        <input type="date" value={date} onChange={(e) => setDate(e.target.value)} className={inputClass} />
-      </Field>
+    <Modal title="Add Work Day 🍒" onClose={onClose}>
+      <Field label="Date"><StyledInput type="date" value={date} onChange={(e) => setDate(e.target.value)} /></Field>
       <div className="grid grid-cols-2 gap-2">
-        <Field label="Start">
-          <input type="time" value={start} onChange={(e) => setStart(e.target.value)} className={inputClass} />
-        </Field>
-        <Field label="End">
-          <input type="time" value={end} onChange={(e) => setEnd(e.target.value)} className={inputClass} />
-        </Field>
+        <Field label="Start"><StyledInput type="time" value={start} onChange={(e) => setStart(e.target.value)} /></Field>
+        <Field label="End"><StyledInput type="time" value={end} onChange={(e) => setEnd(e.target.value)} /></Field>
       </div>
-      <Field label="Break (minutes)">
-        <input type="number" value={breakMin} onChange={(e) => setBreakMin(e.target.value)} className={inputClass} />
-      </Field>
+      <Field label="Break (minutes)"><StyledInput type="number" value={breakMin} onChange={(e) => setBreakMin(e.target.value)} /></Field>
 
-      <div className="bg-zinc-800/60 rounded-xl p-3 my-3 grid grid-cols-3 gap-2 text-center">
+      <div className="rounded-2xl p-3 my-3 grid grid-cols-3 gap-2 text-center" style={{ background: C.cardAlt, border: `1.5px solid ${C.line}` }}>
         <div>
-          <p className="text-[10px] text-zinc-500">Hours</p>
-          <p className="font-mono text-sm text-zinc-100">{formatHM(hours)}</p>
+          <p className="text-[10px] font-bold" style={{ color: C.inkSoft }}>Hours</p>
+          <p className="text-sm font-extrabold" style={{ color: C.ink, fontFamily: FONT_DISPLAY }}>{formatHM(hours)}</p>
         </div>
         <div>
-          <p className="text-[10px] text-zinc-500">Gross</p>
-          <p className="font-mono text-sm text-sky-400">{fmtEuro(gross)}</p>
+          <p className="text-[10px] font-bold" style={{ color: C.inkSoft }}>Gross</p>
+          <p className="text-sm font-extrabold" style={{ color: C.blueText, fontFamily: FONT_DISPLAY }}>{fmtEuro(gross)}</p>
         </div>
         <div>
-          <p className="text-[10px] text-zinc-500">Net</p>
-          <p className="font-mono text-sm text-emerald-400">{fmtEuro(net)}</p>
+          <p className="text-[10px] font-bold" style={{ color: C.inkSoft }}>Net</p>
+          <p className="text-sm font-extrabold" style={{ color: C.sageText, fontFamily: FONT_DISPLAY }}>{fmtEuro(net)}</p>
         </div>
       </div>
-      <p className="text-[11px] text-zinc-500 -mt-2 mb-3">Using rate {fmtEuro(rate)}/h for this date.</p>
+      <p className="text-[11px] -mt-2 mb-3" style={{ color: C.inkSoft }}>Using rate {fmtEuro(rate)}/h for this date.</p>
 
-      <button
-        onClick={() => onSave({ date, start, end, breakMin })}
-        className="w-full bg-emerald-400 text-zinc-950 font-medium rounded-xl py-2.5"
-      >
+      <PillButton onClick={() => onSave({ date, start, end, breakMin })} bg={C.pink} bgDeep={C.pinkDeep} className="w-full">
         Save
-      </button>
+      </PillButton>
     </Modal>
   );
 }
@@ -1468,44 +1571,33 @@ function EditWorkModal({ settings, entry, onClose, onSave }) {
   const { gross, net } = calcPay(hours, rate, settings);
 
   return (
-    <Modal title="Edit Work Day" onClose={onClose}>
-      <Field label="Date">
-        <input type="date" value={date} onChange={(e) => setDate(e.target.value)} className={inputClass} />
-      </Field>
+    <Modal title="Edit Work Day ✏️" onClose={onClose}>
+      <Field label="Date"><StyledInput type="date" value={date} onChange={(e) => setDate(e.target.value)} /></Field>
       <div className="grid grid-cols-2 gap-2">
-        <Field label="Start">
-          <input type="time" value={start} onChange={(e) => setStart(e.target.value)} className={inputClass} />
-        </Field>
-        <Field label="End">
-          <input type="time" value={end} onChange={(e) => setEnd(e.target.value)} className={inputClass} />
-        </Field>
+        <Field label="Start"><StyledInput type="time" value={start} onChange={(e) => setStart(e.target.value)} /></Field>
+        <Field label="End"><StyledInput type="time" value={end} onChange={(e) => setEnd(e.target.value)} /></Field>
       </div>
-      <Field label="Break (minutes)">
-        <input type="number" value={breakMin} onChange={(e) => setBreakMin(e.target.value)} className={inputClass} />
-      </Field>
+      <Field label="Break (minutes)"><StyledInput type="number" value={breakMin} onChange={(e) => setBreakMin(e.target.value)} /></Field>
 
-      <div className="bg-zinc-800/60 rounded-xl p-3 my-3 grid grid-cols-3 gap-2 text-center">
+      <div className="rounded-2xl p-3 my-3 grid grid-cols-3 gap-2 text-center" style={{ background: C.cardAlt, border: `1.5px solid ${C.line}` }}>
         <div>
-          <p className="text-[10px] text-zinc-500">Hours</p>
-          <p className="font-mono text-sm text-zinc-100">{formatHM(hours)}</p>
+          <p className="text-[10px] font-bold" style={{ color: C.inkSoft }}>Hours</p>
+          <p className="text-sm font-extrabold" style={{ color: C.ink, fontFamily: FONT_DISPLAY }}>{formatHM(hours)}</p>
         </div>
         <div>
-          <p className="text-[10px] text-zinc-500">Gross</p>
-          <p className="font-mono text-sm text-sky-400">{fmtEuro(gross)}</p>
+          <p className="text-[10px] font-bold" style={{ color: C.inkSoft }}>Gross</p>
+          <p className="text-sm font-extrabold" style={{ color: C.blueText, fontFamily: FONT_DISPLAY }}>{fmtEuro(gross)}</p>
         </div>
         <div>
-          <p className="text-[10px] text-zinc-500">Net</p>
-          <p className="font-mono text-sm text-emerald-400">{fmtEuro(net)}</p>
+          <p className="text-[10px] font-bold" style={{ color: C.inkSoft }}>Net</p>
+          <p className="text-sm font-extrabold" style={{ color: C.sageText, fontFamily: FONT_DISPLAY }}>{fmtEuro(net)}</p>
         </div>
       </div>
-      <p className="text-[11px] text-zinc-500 -mt-2 mb-3">Using rate {fmtEuro(rate)}/h for this date.</p>
+      <p className="text-[11px] -mt-2 mb-3" style={{ color: C.inkSoft }}>Using rate {fmtEuro(rate)}/h for this date.</p>
 
-      <button
-        onClick={() => onSave({ ...entry, date, start, end, breakMin })}
-        className="w-full bg-emerald-400 text-zinc-950 font-medium rounded-xl py-2.5"
-      >
+      <PillButton onClick={() => onSave({ ...entry, date, start, end, breakMin })} bg={C.pink} bgDeep={C.pinkDeep} className="w-full">
         Save Changes
-      </button>
+      </PillButton>
     </Modal>
   );
 }
@@ -1513,16 +1605,10 @@ function EditWorkModal({ settings, entry, onClose, onSave }) {
 function ConfirmDeleteModal({ onCancel, onConfirm }) {
   return (
     <Modal title="Delete Entry?" onClose={onCancel}>
-      <p className="text-sm text-zinc-400 mb-4">
-        This work log entry will be permanently removed. This can't be undone.
-      </p>
+      <p className="text-sm mb-4" style={{ color: C.inkSoft }}>This work log entry will be permanently removed. This can't be undone.</p>
       <div className="grid grid-cols-2 gap-2">
-        <button onClick={onCancel} className="w-full bg-zinc-800 text-zinc-300 font-medium rounded-xl py-2.5">
-          Cancel
-        </button>
-        <button onClick={onConfirm} className="w-full bg-red-500 text-zinc-950 font-medium rounded-xl py-2.5">
-          Delete
-        </button>
+        <PillButton onClick={onCancel} bg={C.cardAlt} bgDeep={C.line} text={C.ink}>Cancel</PillButton>
+        <PillButton onClick={onConfirm} bg={C.red} bgDeep={C.redDeep}>Delete</PillButton>
       </div>
     </Modal>
   );
@@ -1533,32 +1619,24 @@ function NetPayPromptModal({ month, currentValue, onSkip, onSave }) {
 
   return (
     <Modal title={`Net Pay After Tax — ${monthLabel(month)}`} onClose={onSkip}>
-      <p className="text-xs text-zinc-500 mb-3">
-        If you know your after-tax net salary for {monthLabel(month)}, enter it now and it'll be saved
-        as your "Net Salary (after all taxes)" for the month. You can skip and update it later on the
-        Dashboard.
+      <p className="text-xs mb-3" style={{ color: C.inkSoft }}>
+        If you know your after-tax net salary for {monthLabel(month)}, enter it now and it'll be saved as your "Net Salary (after all
+        taxes)" for the month. You can skip and update it later on the Dashboard.
       </p>
       <Field label="Net pay after tax">
-        <div className="flex items-center gap-2 bg-zinc-800 border border-zinc-700 rounded-xl px-3 py-2">
-          <span className="text-zinc-500">€</span>
+        <div className="flex items-center gap-2 rounded-2xl px-3 py-2" style={{ background: C.cardAlt, border: `2px solid ${C.line}` }}>
+          <span style={{ color: C.inkSoft }}>€</span>
           <input
-            type="number"
-            step="0.01"
-            placeholder="0.00"
-            value={value}
-            onChange={(e) => setValue(e.target.value)}
-            autoFocus
-            className="w-full bg-transparent text-zinc-50 text-sm focus:outline-none"
+            type="number" step="0.01" placeholder="0.00" value={value}
+            onChange={(e) => setValue(e.target.value)} autoFocus
+            className="w-full bg-transparent text-sm focus:outline-none"
+            style={{ color: C.ink }}
           />
         </div>
       </Field>
       <div className="grid grid-cols-2 gap-2 mt-1">
-        <button onClick={onSkip} className="w-full bg-zinc-800 text-zinc-300 font-medium rounded-xl py-2.5">
-          Skip
-        </button>
-        <button onClick={() => onSave(value)} className="w-full bg-emerald-400 text-zinc-950 font-medium rounded-xl py-2.5">
-          Save
-        </button>
+        <PillButton onClick={onSkip} bg={C.cardAlt} bgDeep={C.line} text={C.ink}>Skip</PillButton>
+        <PillButton onClick={() => onSave(value)} bg={C.pink} bgDeep={C.pinkDeep}>Save</PillButton>
       </div>
     </Modal>
   );
