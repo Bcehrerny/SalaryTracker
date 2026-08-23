@@ -234,6 +234,57 @@ function periodForDay(day) {
   if (day <= 20) return 2;
   return 3;
 }
+
+/* ---------- tip split calculator (before/after 17:00, 50% to kitchen) ---------- */
+const TIP_SPLIT_TIME = "17:00";
+const KITCHEN_SHARE_PCT = 50;
+
+// how many hours a shift falls before/after the split time
+function splitHoursAroundTime(start, end, splitTime) {
+  let s = timeToMinutes(start);
+  let e = timeToMinutes(end);
+  if (e <= s) e += 24 * 60; // overnight shift safety
+  const split = timeToMinutes(splitTime);
+  const beforeMin = Math.max(0, Math.min(e, split) - s);
+  const eveningMin = Math.max(0, e - Math.max(s, split));
+  return { beforeH: beforeMin / 60, eveningH: eveningMin / 60 };
+}
+
+// splits the day's tips into a before-17:00 pool and an evening pool
+// (closing total minus the before-17:00 total), takes the kitchen's cut out
+// of each pool, then shares what's left among everyone proportional to the
+// hours they worked within that pool
+function calcTipSplit({ myShift, colleagues, tipBefore, tipClosing, splitTime = TIP_SPLIT_TIME, kitchenPct = KITCHEN_SHARE_PCT }) {
+  const staffFactor = 1 - kitchenPct / 100;
+  const before = Number(tipBefore) || 0;
+  const closing = Number(tipClosing) || 0;
+  const eveningTotal = Math.max(0, closing - before);
+
+  const beforePoolStaff = before * staffFactor;
+  const eveningPoolStaff = eveningTotal * staffFactor;
+
+  const all = [myShift, ...(colleagues || [])].filter((p) => p && p.start && p.end);
+  const withHours = all.map((p) => ({ ...p, ...splitHoursAroundTime(p.start, p.end, splitTime) }));
+
+  const totalBeforeH = withHours.reduce((s, p) => s + p.beforeH, 0);
+  const totalEveningH = withHours.reduce((s, p) => s + p.eveningH, 0);
+
+  const me = withHours[0] || { beforeH: 0, eveningH: 0 };
+  const myBeforeShare = totalBeforeH > 0 ? beforePoolStaff * (me.beforeH / totalBeforeH) : 0;
+  const myEveningShare = totalEveningH > 0 ? eveningPoolStaff * (me.eveningH / totalEveningH) : 0;
+
+  return {
+    beforePoolStaff,
+    eveningPoolStaff,
+    totalBeforeH,
+    totalEveningH,
+    myBeforeH: me.beforeH,
+    myEveningH: me.eveningH,
+    myBeforeShare,
+    myEveningShare,
+    myTotal: myBeforeShare + myEveningShare,
+  };
+}
 function migrateTips(rawTips) {
   const buckets = {};
   (rawTips || []).forEach((t) => {
@@ -489,8 +540,11 @@ export default function App() {
   const [futureShifts, setFutureShifts] = useState([]);
   const [manualNetSalaries, setManualNetSalaries] = useState({});
   const [tipPeriodRanges, setTipPeriodRanges] = useState({});
+  const [tipEstimates, setTipEstimates] = useState([]);
   const [tab, setTab] = useState("dashboard");
   const [showAddWork, setShowAddWork] = useState(false);
+  const [showTipCalc, setShowTipCalc] = useState(false);
+  const [editingEstimate, setEditingEstimate] = useState(null);
   const [editingWorkDay, setEditingWorkDay] = useState(null);
   const [confirmDeleteId, setConfirmDeleteId] = useState(null);
   const [netPromptMonth, setNetPromptMonth] = useState(null);
@@ -508,6 +562,7 @@ export default function App() {
           setTips(migrateTips(parsed.tips));
           setFutureShifts(parsed.futureShifts || []);
           setTipPeriodRanges(parsed.tipPeriodRanges || {});
+          setTipEstimates(parsed.tipEstimates || []);
           if (parsed.manualNetSalaries) {
             setManualNetSalaries(parsed.manualNetSalaries);
           } else if (parsed.manualTaxes) {
@@ -536,6 +591,7 @@ export default function App() {
         futureShifts: next.futureShifts ?? futureShifts,
         manualNetSalaries: next.manualNetSalaries ?? manualNetSalaries,
         tipPeriodRanges: next.tipPeriodRanges ?? tipPeriodRanges,
+        tipEstimates: next.tipEstimates ?? tipEstimates,
       };
       const result = await window.storage.set(STORAGE_KEY, JSON.stringify(payload), false);
       if (!result) setSaveError(true);
@@ -543,6 +599,19 @@ export default function App() {
     } catch (e) {
       setSaveError(true);
     }
+  }
+  function upsertTipEstimate(record) {
+    const exists = tipEstimates.some((e) => e.id === record.id);
+    const next = exists
+      ? tipEstimates.map((e) => (e.id === record.id ? record : e))
+      : [...tipEstimates, record];
+    setTipEstimates(next);
+    persist({ tipEstimates: next });
+  }
+  function removeTipEstimate(id) {
+    const next = tipEstimates.filter((e) => e.id !== id);
+    setTipEstimates(next);
+    persist({ tipEstimates: next });
   }
 
   function addWorkDay(entry) {
@@ -612,8 +681,9 @@ export default function App() {
     const set = new Set([todayStr().slice(0, 7)]);
     workDays.forEach((w) => set.add(monthKey(w.date)));
     tips.forEach((t) => set.add(t.month));
+    tipEstimates.forEach((e) => set.add(monthKey(e.date)));
     return Array.from(set).sort();
-  }, [workDays, tips]);
+  }, [workDays, tips, tipEstimates]);
 
   const [selectedMonth, setSelectedMonth] = useState(todayStr().slice(0, 7));
   useEffect(() => {
@@ -622,6 +692,10 @@ export default function App() {
 
   const monthWorkDays = useMemo(() => workDays.filter((w) => monthKey(w.date) === selectedMonth), [workDays, selectedMonth]);
   const monthTips = useMemo(() => tips.filter((t) => t.month === selectedMonth), [tips, selectedMonth]);
+  const monthEstimates = useMemo(
+    () => tipEstimates.filter((e) => monthKey(e.date) === selectedMonth),
+    [tipEstimates, selectedMonth]
+  );
 
   const summary = useMemo(() => {
     const totalHours = monthWorkDays.reduce((s, d) => s + d.hours, 0);
@@ -706,6 +780,16 @@ export default function App() {
             onUpsert={upsertTip}
             tipRanges={getTipRanges(tipPeriodRanges, selectedMonth)}
             onRangeChange={(period, field, value) => setTipRangeField(selectedMonth, period, field, value)}
+            monthEstimates={monthEstimates}
+            onOpenCalculator={() => {
+              setEditingEstimate(null);
+              setShowTipCalc(true);
+            }}
+            onEditEstimate={(record) => {
+              setEditingEstimate(record);
+              setShowTipCalc(true);
+            }}
+            onDeleteEstimate={removeTipEstimate}
           />
         )}
 
@@ -750,6 +834,21 @@ export default function App() {
             addWorkDay(entry);
             setShowAddWork(false);
             setNetPromptMonth(monthKey(entry.date));
+          }}
+        />
+      )}
+
+      {showTipCalc && (
+        <TipCalculatorModal
+          initial={editingEstimate}
+          onClose={() => {
+            setShowTipCalc(false);
+            setEditingEstimate(null);
+          }}
+          onSave={(record) => {
+            upsertTipEstimate(record);
+            setShowTipCalc(false);
+            setEditingEstimate(null);
           }}
         />
       )}
@@ -1009,7 +1108,10 @@ function WorkLog({ months, selectedMonth, setSelectedMonth, monthWorkDays, onEdi
 }
 
 /* ---------- Tips ---------- */
-function TipsPage({ months, selectedMonth, setSelectedMonth, monthTips, onUpsert, tipRanges, onRangeChange }) {
+function TipsPage({
+  months, selectedMonth, setSelectedMonth, monthTips, onUpsert, tipRanges, onRangeChange,
+  monthEstimates, onOpenCalculator, onEditEstimate, onDeleteEstimate,
+}) {
   const total = monthTips.reduce((s, t) => s + t.amount, 0);
   return (
     <div>
@@ -1032,6 +1134,45 @@ function TipsPage({ months, selectedMonth, setSelectedMonth, monthTips, onUpsert
             onRangeChange={onRangeChange}
           />
         ))}
+      </div>
+
+      <div className="mt-6">
+        <SectionTitle icon={Sparkles} color={C.blueText}>Tip Calculator</SectionTitle>
+        <PillButton onClick={onOpenCalculator} bg={C.blue} bgDeep={C.blueDeep} className="w-full mb-3">
+          🧮 Calculate today's tip
+        </PillButton>
+        {monthEstimates && monthEstimates.length > 0 && (
+          <div className="flex flex-col gap-2">
+            {monthEstimates
+              .slice()
+              .sort((a, b) => b.date.localeCompare(a.date))
+              .map((e) => (
+                <Card key={e.id} accent={C.blue} className="cursor-pointer" style={{ cursor: "pointer" }}>
+                  <div className="flex items-center justify-between" onClick={() => onEditEstimate(e)}>
+                    <div>
+                      <p className="text-[11px] font-bold" style={{ color: C.inkSoft }}>
+                        {e.date} · {e.myStart}–{e.myEnd}
+                      </p>
+                      <p className="text-lg font-extrabold" style={{ color: C.blueText, fontFamily: FONT_DISPLAY }}>
+                        {fmtEuro(e.myTotal)}
+                      </p>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <Pencil size={14} style={{ color: C.inkSoft }} />
+                      <button
+                        onClick={(ev) => {
+                          ev.stopPropagation();
+                          onDeleteEstimate(e.id);
+                        }}
+                      >
+                        <Trash2 size={15} style={{ color: C.inkSoft }} />
+                      </button>
+                    </div>
+                  </div>
+                </Card>
+              ))}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -1074,6 +1215,127 @@ function TipPeriodCard({ month, period, range, amount, onUpsert, onRangeChange }
         />
       </div>
     </Card>
+  );
+}
+
+function TipCalculatorModal({ onClose, onSave, initial }) {
+  const isEditing = !!initial;
+  const [date, setDate] = useState(initial?.date || todayStr());
+  const [myStart, setMyStart] = useState(initial?.myStart || "17:00");
+  const [myEnd, setMyEnd] = useState(initial?.myEnd || "22:00");
+  const [colleagues, setColleagues] = useState(
+    initial?.colleagues ? initial.colleagues.map((c) => ({ ...c, id: c.id || uid() })) : []
+  );
+  const [newColStart, setNewColStart] = useState("17:00");
+  const [newColEnd, setNewColEnd] = useState("22:00");
+  const [tipBefore, setTipBefore] = useState(initial?.tipBefore != null ? String(initial.tipBefore) : "");
+  const [tipClosing, setTipClosing] = useState(initial?.tipClosing != null ? String(initial.tipClosing) : "");
+
+  function addColleague() {
+    if (!newColStart || !newColEnd) return;
+    setColleagues([...colleagues, { id: uid(), start: newColStart, end: newColEnd }]);
+  }
+  function removeColleague(id) {
+    setColleagues(colleagues.filter((c) => c.id !== id));
+  }
+
+  const result = calcTipSplit({
+    myShift: { start: myStart, end: myEnd },
+    colleagues,
+    tipBefore,
+    tipClosing,
+  });
+
+  return (
+    <Modal title={isEditing ? "Edit Tip Estimate ✏️" : "Tip Calculator 🧮"} onClose={onClose}>
+      <Field label="Date">
+        <StyledInput type="date" value={date} onChange={(e) => setDate(e.target.value)} />
+      </Field>
+
+      <div className="rounded-2xl p-3 mb-3" style={{ background: C.cardAlt, border: `1.5px solid ${C.line}` }}>
+        <p className="text-xs font-bold mb-2" style={{ color: C.pinkText }}>My Shift</p>
+        <div className="grid grid-cols-2 gap-2">
+          <Field label="Start"><StyledInput type="time" value={myStart} onChange={(e) => setMyStart(e.target.value)} /></Field>
+          <Field label="End"><StyledInput type="time" value={myEnd} onChange={(e) => setMyEnd(e.target.value)} /></Field>
+        </div>
+      </div>
+
+      <div className="rounded-2xl p-3 mb-3" style={{ background: C.cardAlt, border: `1.5px solid ${C.line}` }}>
+        <p className="text-xs font-bold mb-2" style={{ color: C.pinkText }}>Coworkers' Shifts</p>
+        {colleagues.length === 0 && (
+          <p className="text-[11px] mb-2" style={{ color: C.inkSoft }}>No coworkers added yet — add whoever worked with you today</p>
+        )}
+        {colleagues.length > 0 && (
+          <div className="flex flex-col gap-2 mb-2">
+            {colleagues.map((c) => (
+              <div
+                key={c.id}
+                className="flex items-center justify-between rounded-xl px-2.5 py-1.5"
+                style={{ background: C.card, border: `1.5px solid ${C.line}` }}
+              >
+                <span className="text-xs font-bold" style={{ color: C.ink }}>{c.start} – {c.end}</span>
+                <button onClick={() => removeColleague(c.id)}>
+                  <Trash2 size={13} style={{ color: C.inkSoft }} />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+        <div className="grid grid-cols-2 gap-2 mb-2">
+          <Field label="Start"><StyledInput type="time" value={newColStart} onChange={(e) => setNewColStart(e.target.value)} /></Field>
+          <Field label="End"><StyledInput type="time" value={newColEnd} onChange={(e) => setNewColEnd(e.target.value)} /></Field>
+        </div>
+        <PillButton onClick={addColleague} bg={C.blue} bgDeep={C.blueDeep} className="py-2 w-full">
+          <Plus size={15} /> Add Coworker
+        </PillButton>
+      </div>
+
+      <div className="grid grid-cols-2 gap-2 mb-3">
+        <Field label={`Tips before ${TIP_SPLIT_TIME} (€)`}>
+          <StyledInput type="number" step="0.01" placeholder="0.00" value={tipBefore} onChange={(e) => setTipBefore(e.target.value)} />
+        </Field>
+        <Field label="Closing total tips (€)">
+          <StyledInput type="number" step="0.01" placeholder="0.00" value={tipClosing} onChange={(e) => setTipClosing(e.target.value)} />
+        </Field>
+      </div>
+
+      <div className="rounded-2xl p-3 mb-3" style={{ background: C.cardAlt, border: `2px solid ${C.honey}77` }}>
+        <div className="grid grid-cols-2 gap-2 mb-2 text-center">
+          <div>
+            <p className="text-[10px] font-bold" style={{ color: C.inkSoft }}>Early share ({result.myBeforeH.toFixed(2)}h)</p>
+            <p className="text-sm font-extrabold" style={{ color: C.ink, fontFamily: FONT_DISPLAY }}>{fmtEuro(result.myBeforeShare)}</p>
+          </div>
+          <div>
+            <p className="text-[10px] font-bold" style={{ color: C.inkSoft }}>Evening share ({result.myEveningH.toFixed(2)}h)</p>
+            <p className="text-sm font-extrabold" style={{ color: C.ink, fontFamily: FONT_DISPLAY }}>{fmtEuro(result.myEveningShare)}</p>
+          </div>
+        </div>
+        <div className="text-center pt-2" style={{ borderTop: `1.5px solid ${C.line}` }}>
+          <p className="text-[10px] font-bold uppercase" style={{ color: C.honeyText }}>You'll get about</p>
+          <p className="text-2xl font-extrabold" style={{ color: C.honeyText, fontFamily: FONT_DISPLAY }}>{fmtEuro(result.myTotal)}</p>
+        </div>
+      </div>
+
+      <PillButton
+        onClick={() =>
+          onSave({
+            id: initial?.id || uid(),
+            date,
+            myStart,
+            myEnd,
+            colleagues,
+            tipBefore: Number(tipBefore) || 0,
+            tipClosing: Number(tipClosing) || 0,
+            myTotal: result.myTotal,
+          })
+        }
+        bg={C.pink}
+        bgDeep={C.pinkDeep}
+        className="w-full"
+      >
+        {isEditing ? "Save Changes" : "Save This Estimate"}
+      </PillButton>
+    </Modal>
   );
 }
 
@@ -1384,7 +1646,7 @@ function PredictionPage({ settings, summary, monthWorkDays, selectedMonth, futur
           <Field label="End"><StyledInput type="time" value={end} onChange={(e) => setEnd(e.target.value)} /></Field>
         </div>
         <PillButton onClick={() => onAdd({ date, start, end })} bg={C.blue} bgDeep={C.blueDeep} className="mt-1">
-          <Plus size={16} /> Add Shift
+          <Plus size={14} /> Add Shift
         </PillButton>
       </Card>
 
