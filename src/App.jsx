@@ -538,7 +538,7 @@ export default function App() {
   const [workDays, setWorkDays] = useState([]);
   const [tips, setTips] = useState([]);
   const [futureShifts, setFutureShifts] = useState([]);
-  const [manualNetSalaries, setManualNetSalaries] = useState({});
+  const [monthlyGoals, setMonthlyGoals] = useState({});
   const [tipPeriodRanges, setTipPeriodRanges] = useState({});
   const [tipEstimates, setTipEstimates] = useState([]);
   const [tab, setTab] = useState("dashboard");
@@ -547,7 +547,6 @@ export default function App() {
   const [editingEstimate, setEditingEstimate] = useState(null);
   const [editingWorkDay, setEditingWorkDay] = useState(null);
   const [confirmDeleteId, setConfirmDeleteId] = useState(null);
-  const [netPromptMonth, setNetPromptMonth] = useState(null);
   const [statsSub, setStatsSub] = useState("calendar");
   const [saveError, setSaveError] = useState(false);
 
@@ -563,17 +562,7 @@ export default function App() {
           setFutureShifts(parsed.futureShifts || []);
           setTipPeriodRanges(parsed.tipPeriodRanges || {});
           setTipEstimates(parsed.tipEstimates || []);
-          if (parsed.manualNetSalaries) {
-            setManualNetSalaries(parsed.manualNetSalaries);
-          } else if (parsed.manualTaxes) {
-            const migrated = {};
-            Object.entries(parsed.manualTaxes).forEach(([month, tax]) => {
-              const monthWork = (parsed.workDays || []).filter((w) => monthKey(w.date) === month);
-              const autoNet = monthWork.reduce((s, d) => s + d.net, 0);
-              migrated[month] = autoNet - tax;
-            });
-            setManualNetSalaries(migrated);
-          }
+          setMonthlyGoals(parsed.monthlyGoals || {});
         }
       } catch (e) {
         // no existing data yet
@@ -589,7 +578,7 @@ export default function App() {
         workDays: next.workDays ?? workDays,
         tips: next.tips ?? tips,
         futureShifts: next.futureShifts ?? futureShifts,
-        manualNetSalaries: next.manualNetSalaries ?? manualNetSalaries,
+        monthlyGoals: next.monthlyGoals ?? monthlyGoals,
         tipPeriodRanges: next.tipPeriodRanges ?? tipPeriodRanges,
         tipEstimates: next.tipEstimates ?? tipEstimates,
       };
@@ -671,10 +660,12 @@ export default function App() {
     setFutureShifts(next);
     persist({ futureShifts: next });
   }
-  function setManualNetForMonth(month, value) {
-    const next = { ...manualNetSalaries, [month]: value === "" ? undefined : Number(value) };
-    setManualNetSalaries(next);
-    persist({ manualNetSalaries: next });
+  function setGoalForMonth(month, value) {
+    const next = { ...monthlyGoals };
+    if (value === "" || isNaN(Number(value))) delete next[month];
+    else next[month] = Number(value);
+    setMonthlyGoals(next);
+    persist({ monthlyGoals: next });
   }
 
   const months = useMemo(() => {
@@ -702,11 +693,8 @@ export default function App() {
     const gross = monthWorkDays.reduce((s, d) => s + d.gross, 0);
     const net = monthWorkDays.reduce((s, d) => s + d.net, 0);
     const tipsSum = monthTips.reduce((s, t) => s + t.amount, 0);
-    const manualNetSalary = manualNetSalaries[selectedMonth];
-    const hasManualEntry = typeof manualNetSalary === "number";
-    const netFinal = hasManualEntry ? manualNetSalary : net;
-    return { totalHours, gross, net, manualNetSalary, hasManualEntry, netFinal, tipsSum, total: netFinal + tipsSum };
-  }, [monthWorkDays, monthTips, manualNetSalaries, selectedMonth]);
+    return { totalHours, gross, net, tipsSum, total: net + tipsSum };
+  }, [monthWorkDays, monthTips]);
 
   const avgIncomePerHour =
     summary.totalHours > 0
@@ -749,6 +737,7 @@ export default function App() {
             setSelectedMonth={setSelectedMonth}
             summary={summary}
             settings={settings}
+            monthlyGoals={monthlyGoals}
             monthWorkDays={monthWorkDays}
             monthTips={monthTips}
             avgIncomePerHour={avgIncomePerHour}
@@ -756,7 +745,7 @@ export default function App() {
             onGoToTips={() => setTab("tips")}
             onEditWork={setEditingWorkDay}
             onDeleteWork={setConfirmDeleteId}
-            onSetManualNet={(val) => setManualNetForMonth(selectedMonth, val)}
+            onSetGoal={(val) => setGoalForMonth(selectedMonth, val)}
           />
         )}
 
@@ -803,7 +792,7 @@ export default function App() {
             workDays={workDays}
             tips={tips}
             settings={settings}
-            manualNetSalaries={manualNetSalaries}
+            monthlyGoals={monthlyGoals}
             tipPeriodRanges={tipPeriodRanges}
           />
         )}
@@ -833,7 +822,6 @@ export default function App() {
           onSave={(entry) => {
             addWorkDay(entry);
             setShowAddWork(false);
-            setNetPromptMonth(monthKey(entry.date));
           }}
         />
       )}
@@ -871,18 +859,6 @@ export default function App() {
           onConfirm={() => {
             deleteWorkDay(confirmDeleteId);
             setConfirmDeleteId(null);
-          }}
-        />
-      )}
-
-      {netPromptMonth && (
-        <NetPayPromptModal
-          month={netPromptMonth}
-          currentValue={manualNetSalaries[netPromptMonth]}
-          onSkip={() => setNetPromptMonth(null)}
-          onSave={(val) => {
-            setManualNetForMonth(netPromptMonth, val);
-            setNetPromptMonth(null);
           }}
         />
       )}
@@ -935,17 +911,18 @@ function BottomNav({ tab, setTab }) {
 
 /* ---------- Dashboard ---------- */
 function Dashboard({
-  months, selectedMonth, setSelectedMonth, summary, settings,
-  monthWorkDays, monthTips, avgIncomePerHour, onAddWork, onGoToTips, onEditWork, onDeleteWork, onSetManualNet,
+  months, selectedMonth, setSelectedMonth, summary, settings, monthlyGoals,
+  monthWorkDays, monthTips, avgIncomePerHour, onAddWork, onGoToTips, onEditWork, onDeleteWork, onSetGoal,
 }) {
-  const goal = settings.monthlyGoal;
+  const hasCustomGoal = typeof monthlyGoals[selectedMonth] === "number";
+  const goal = hasCustomGoal ? monthlyGoals[selectedMonth] : settings.monthlyGoal;
   const pct = goal > 0 ? summary.total / goal : 0;
   const remaining = Math.max(goal - summary.total, 0);
   const hoursNeeded = avgIncomePerHour > 0 ? remaining / avgIncomePerHour : 0;
 
-  const [netInput, setNetInput] = useState(summary.manualNetSalary ? String(summary.manualNetSalary) : "");
+  const [goalInput, setGoalInput] = useState(hasCustomGoal ? String(monthlyGoals[selectedMonth]) : "");
   useEffect(() => {
-    setNetInput(summary.manualNetSalary ? String(summary.manualNetSalary) : "");
+    setGoalInput(typeof monthlyGoals[selectedMonth] === "number" ? String(monthlyGoals[selectedMonth]) : "");
   }, [selectedMonth]); // eslint-disable-line
 
   const recent = useMemo(() => {
@@ -975,33 +952,33 @@ function Dashboard({
         <Card><StatBlock label="Tips" value={fmtEuro(summary.tipsSum)} accent={C.honeyText} /></Card>
       </div>
 
-      <Card className="mb-4">
-        <SectionTitle icon={Sparkles}>Net Salary (after all taxes)</SectionTitle>
-        <div className="flex items-center gap-2 mt-1">
+      <Card className="mb-4" accent={C.pink}>
+        <div className="flex items-center justify-between mb-2">
+          <div className="flex items-center gap-2">
+            <Target size={15} style={{ color: C.pinkText }} />
+            <span className="text-sm font-extrabold" style={{ color: C.ink, fontFamily: FONT_DISPLAY }}>
+              Goal for {monthLabel(selectedMonth).split(" ")[0]}
+            </span>
+          </div>
+        </div>
+        <div className="flex items-center gap-2 mb-2">
           <span style={{ color: C.inkSoft }}>€</span>
           <input
             type="number"
-            step="0.01"
-            placeholder={summary.net.toFixed(2)}
-            value={netInput}
+            step="1"
+            placeholder={String(settings.monthlyGoal)}
+            value={goalInput}
             onChange={(e) => {
-              setNetInput(e.target.value);
-              onSetManualNet(e.target.value);
+              setGoalInput(e.target.value);
+              onSetGoal(e.target.value);
             }}
             className="w-full bg-transparent text-lg font-extrabold tabular-nums focus:outline-none"
-            style={{ color: C.sageText, fontFamily: FONT_DISPLAY }}
+            style={{ color: C.pinkText, fontFamily: FONT_DISPLAY }}
           />
         </div>
-        <p className="text-[11px] mt-1" style={{ color: C.inkSoft }}>
-          {summary.hasManualEntry ? <>Manually entered: {fmtEuro(summary.netFinal)}</> : <>Auto-calculated from work log: {fmtEuro(summary.net)}</>}
-        </p>
-      </Card>
-
-      <Card className="mb-4" accent={C.pink}>
-        <div className="flex items-center gap-2 mb-2">
-          <Target size={15} style={{ color: C.pinkText }} />
-          <span className="text-sm font-extrabold" style={{ color: C.ink, fontFamily: FONT_DISPLAY }}>Goal {fmtEuro(goal)}</span>
-        </div>
+        {/* <p className="text-[11px] mb-2" style={{ color: C.inkSoft }}>
+          {hasCustomGoal ? "Custom goal for this month" : `Using default goal (${fmtEuro(settings.monthlyGoal)})`}
+        </p> */}
         <ProgressBar pct={pct} />
         <div className="flex justify-between mt-2 text-[11px]" style={{ color: C.inkSoft }}>
           <span>{fmtEuro(summary.total)} / {fmtEuro(goal)}</span>
@@ -1028,33 +1005,13 @@ function Dashboard({
       <h3 className="text-sm font-extrabold mb-2 flex items-center gap-1.5" style={{ color: C.ink, fontFamily: FONT_DISPLAY }}>
         <Clock size={14} style={{ color: C.pinkText }} /> Recent
       </h3>
-      <div className="flex flex-col gap-2">
-        {recent.length === 0 && <p className="text-sm" style={{ color: C.inkSoft }}>Nothing logged yet this month 🎀</p>}
+      <div className="grid grid-cols-2 gap-2">
+        {recent.length === 0 && <p className="col-span-2 text-sm" style={{ color: C.inkSoft }}>Nothing logged yet this month 🎀</p>}
         {recent.map((r) => (
-          <WorkRow key={r.id} row={r} onEdit={onEditWork} onDelete={onDeleteWork} />
+          <WorkGridCard key={r.id} row={r} onEdit={onEditWork} onDelete={onDeleteWork} />
         ))}
       </div>
     </div>
-  );
-}
-
-function WorkRow({ row, onEdit, onDelete }) {
-  return (
-    <Card className="flex items-center justify-between">
-      <button onClick={() => onEdit(row)} className="flex-1 text-left">
-        <p className="text-sm font-extrabold" style={{ color: C.ink, fontFamily: FONT_DISPLAY }}>{shiftDayLabel(row.date)}</p>
-        <p className="text-xs" style={{ color: C.inkSoft }}>{row.start}–{row.end} · {formatHM(row.hours)}</p>
-      </button>
-      <div className="flex items-center gap-3">
-        <span className="font-extrabold text-sm tabular-nums" style={{ color: C.sageText }}>{fmtEuro(row.net)}</span>
-        <button onClick={() => onEdit(row)}>
-          <Pencil size={15} style={{ color: C.inkSoft }} />
-        </button>
-        <button onClick={() => onDelete(row.id)}>
-          <Trash2 size={15} style={{ color: C.inkSoft }} />
-        </button>
-      </div>
-    </Card>
   );
 }
 
@@ -1097,13 +1054,34 @@ function WorkLog({ months, selectedMonth, setSelectedMonth, monthWorkDays, onEdi
         </div>
       </Card>
 
-      <div className="flex flex-col gap-2">
-        {filtered.length === 0 && <p className="text-sm text-center mt-6" style={{ color: C.inkSoft }}>No shifts in this date range 🌸</p>}
+      <div className="grid grid-cols-2 gap-2">
+        {filtered.length === 0 && <p className="col-span-2 text-sm text-center mt-6" style={{ color: C.inkSoft }}>No shifts in this date range 🌸</p>}
         {filtered.map((r) => (
-          <WorkRow key={r.id} row={r} onEdit={onEdit} onDelete={onDelete} />
+          <WorkGridCard key={r.id} row={r} onEdit={onEdit} onDelete={onDelete} />
         ))}
       </div>
     </div>
+  );
+}
+
+function WorkGridCard({ row, onEdit, onDelete }) {
+  return (
+    <Card style={{ cursor: "pointer" }}>
+      <div onClick={() => onEdit(row)}>
+        <p className="text-xs font-extrabold" style={{ color: C.ink, fontFamily: FONT_DISPLAY }}>{shiftDayLabel(row.date)}</p>
+        <p className="text-[10px]" style={{ color: C.inkSoft }}>{row.start}–{row.end}</p>
+        <p className="text-[10px]" style={{ color: C.inkSoft }}>{formatHM(row.hours)}</p>
+        <p className="text-sm font-extrabold mt-1" style={{ color: C.sageText, fontFamily: FONT_DISPLAY }}>{fmtEuro(row.net)}</p>
+      </div>
+      <div className="flex items-center justify-end gap-2 mt-1.5">
+        <button onClick={() => onEdit(row)}>
+          <Pencil size={12} style={{ color: C.inkSoft }} />
+        </button>
+        <button onClick={() => onDelete(row.id)}>
+          <Trash2 size={13} style={{ color: C.inkSoft }} />
+        </button>
+      </div>
+    </Card>
   );
 }
 
@@ -1119,9 +1097,9 @@ function TipsPage({
       <Card className="mb-4" accent={C.honey}>
         <StatBlock label="Tips this month" value={fmtEuro(total)} accent={C.honeyText} />
       </Card>
-      <p className="text-xs mb-3" style={{ color: C.inkSoft }}>
+      {/* <p className="text-xs mb-3" style={{ color: C.inkSoft }}>
         Tips are paid out 3 times a month. Defaults to days 1–10, 11–20, 21–end — tap the day numbers below to adjust a range if a payout lands early or late.
-      </p>
+      </p> */}
       <div className="flex flex-col gap-3">
         {TIP_PERIODS.map((period) => (
           <TipPeriodCard
@@ -1137,41 +1115,53 @@ function TipsPage({
       </div>
 
       <div className="mt-6">
-        <SectionTitle icon={Sparkles} color={C.blueText}>Tip Calculator</SectionTitle>
+        <SectionTitle icon={Sparkles} color={C.blueText}>Tip Calculator (estimate only)</SectionTitle>
+        {/* <p className="text-xs mb-3" style={{ color: C.inkSoft }}>
+          Estimate how much tip you'd get for today's shift, and compare it against what you record above. This estimate is never counted toward your monthly income.
+        </p> */}
         <PillButton onClick={onOpenCalculator} bg={C.blue} bgDeep={C.blueDeep} className="w-full mb-3">
           🧮 Calculate today's tip
         </PillButton>
         {monthEstimates && monthEstimates.length > 0 && (
-          <div className="flex flex-col gap-2">
-            {monthEstimates
-              .slice()
-              .sort((a, b) => b.date.localeCompare(a.date))
-              .map((e) => (
-                <Card key={e.id} accent={C.blue} className="cursor-pointer" style={{ cursor: "pointer" }}>
-                  <div className="flex items-center justify-between" onClick={() => onEditEstimate(e)}>
-                    <div>
-                      <p className="text-[11px] font-bold" style={{ color: C.inkSoft }}>
-                        {e.date} · {e.myStart}–{e.myEnd}
-                      </p>
-                      <p className="text-lg font-extrabold" style={{ color: C.blueText, fontFamily: FONT_DISPLAY }}>
+          <>
+            <Card className="mb-3" accent={C.blue}>
+              <StatBlock
+                label="Predicted Tips Total"
+                value={fmtEuro(monthEstimates.reduce((s, e) => s + (e.myTotal || 0), 0))}
+                accent={C.blueText}
+                sub={`${monthEstimates.length} shift${monthEstimates.length === 1 ? "" : "s"} estimated`}
+              />
+            </Card>
+            <div className="grid grid-cols-2 gap-2">
+              {monthEstimates
+                .slice()
+                .sort((a, b) => b.date.localeCompare(a.date))
+                .map((e) => (
+                  <Card key={e.id} accent={C.blue} style={{ cursor: "pointer" }}>
+                    <div onClick={() => onEditEstimate(e)}>
+                      <p className="text-[10px] font-bold" style={{ color: C.inkSoft }}>{shiftDayLabel(e.date)}</p>
+                      <p className="text-[10px]" style={{ color: C.inkSoft }}>{e.myStart}–{e.myEnd}</p>
+                      <p className="text-base font-extrabold mt-1" style={{ color: C.blueText, fontFamily: FONT_DISPLAY }}>
                         {fmtEuro(e.myTotal)}
                       </p>
                     </div>
-                    <div className="flex items-center gap-2">
-                      <Pencil size={14} style={{ color: C.inkSoft }} />
+                    <div className="flex items-center justify-end gap-2 mt-1.5">
+                      <button onClick={() => onEditEstimate(e)}>
+                        <Pencil size={12} style={{ color: C.inkSoft }} />
+                      </button>
                       <button
                         onClick={(ev) => {
                           ev.stopPropagation();
                           onDeleteEstimate(e.id);
                         }}
                       >
-                        <Trash2 size={15} style={{ color: C.inkSoft }} />
+                        <Trash2 size={13} style={{ color: C.inkSoft }} />
                       </button>
                     </div>
-                  </div>
-                </Card>
-              ))}
-          </div>
+                  </Card>
+                ))}
+            </div>
+          </>
         )}
       </div>
     </div>
@@ -1222,12 +1212,12 @@ function TipCalculatorModal({ onClose, onSave, initial }) {
   const isEditing = !!initial;
   const [date, setDate] = useState(initial?.date || todayStr());
   const [myStart, setMyStart] = useState(initial?.myStart || "17:00");
-  const [myEnd, setMyEnd] = useState(initial?.myEnd || "22:00");
+  const [myEnd, setMyEnd] = useState(initial?.myEnd || "22:30");
   const [colleagues, setColleagues] = useState(
     initial?.colleagues ? initial.colleagues.map((c) => ({ ...c, id: c.id || uid() })) : []
   );
   const [newColStart, setNewColStart] = useState("17:00");
-  const [newColEnd, setNewColEnd] = useState("22:00");
+  const [newColEnd, setNewColEnd] = useState("22:30");
   const [tipBefore, setTipBefore] = useState(initial?.tipBefore != null ? String(initial.tipBefore) : "");
   const [tipClosing, setTipClosing] = useState(initial?.tipClosing != null ? String(initial.tipClosing) : "");
 
@@ -1248,6 +1238,10 @@ function TipCalculatorModal({ onClose, onSave, initial }) {
 
   return (
     <Modal title={isEditing ? "Edit Tip Estimate ✏️" : "Tip Calculator 🧮"} onClose={onClose}>
+      <p className="text-xs mb-3" style={{ color: C.inkSoft }}>
+        Splits the day's tips into a before-{TIP_SPLIT_TIME} pool and an evening pool, takes {KITCHEN_SHARE_PCT}% off each for the kitchen, then shares the rest based on everyone's hours in that window. This is just an estimate and won't affect your recorded tips.
+      </p>
+
       <Field label="Date">
         <StyledInput type="date" value={date} onChange={(e) => setDate(e.target.value)} />
       </Field>
@@ -1340,7 +1334,7 @@ function TipCalculatorModal({ onClose, onSave, initial }) {
 }
 
 /* ---------- Stats ---------- */
-function StatsPage({ statsSub, setStatsSub, months, selectedMonth, setSelectedMonth, workDays, tips, settings, manualNetSalaries, tipPeriodRanges }) {
+function StatsPage({ statsSub, setStatsSub, months, selectedMonth, setSelectedMonth, workDays, tips, settings, monthlyGoals, tipPeriodRanges }) {
   const monthWorkDays = workDays.filter((w) => monthKey(w.date) === selectedMonth);
   const monthTips = tips.filter((t) => t.month === selectedMonth);
   const tipRanges = getTipRanges(tipPeriodRanges, selectedMonth);
@@ -1349,17 +1343,14 @@ function StatsPage({ statsSub, setStatsSub, months, selectedMonth, setSelectedMo
   const gross = monthWorkDays.reduce((s, d) => s + d.gross, 0);
   const net = monthWorkDays.reduce((s, d) => s + d.net, 0);
   const tipsSum = monthTips.reduce((s, t) => s + t.amount, 0);
-  const manualNetSalary = manualNetSalaries[selectedMonth];
-  const hasManualEntry = typeof manualNetSalary === "number";
-  const netFinal = hasManualEntry ? manualNetSalary : net;
-  const total = netFinal + tipsSum;
+  const total = net + tipsSum;
 
   const workedDaysCount = new Set(monthWorkDays.map((d) => d.date)).size;
   const avgHoursPerShift = monthWorkDays.length ? totalHours / monthWorkDays.length : 0;
   const weeksInMonth = Math.max(1, monthDays(selectedMonth) / 7);
   const avgHoursPerWeek = totalHours / weeksInMonth;
 
-  const avgNetPerHour = totalHours ? netFinal / totalHours : 0;
+  const avgNetPerHour = totalHours ? net / totalHours : 0;
   const avgTipPerHour = totalHours ? tipsSum / totalHours : 0;
   const avgIncomePerHour = avgNetPerHour + avgTipPerHour;
 
@@ -1372,7 +1363,7 @@ function StatsPage({ statsSub, setStatsSub, months, selectedMonth, setSelectedMo
   const highestTip = monthTips.length ? Math.max(...monthTips.map((t) => t.amount)) : 0;
   const avgTipPerPeriod = monthTips.length ? tipsSum / monthTips.length : 0;
 
-  const goal = settings.monthlyGoal;
+  const goal = typeof monthlyGoals[selectedMonth] === "number" ? monthlyGoals[selectedMonth] : settings.monthlyGoal;
   const pct = goal > 0 ? total / goal : 0;
   const remaining = Math.max(goal - total, 0);
   const hoursNeeded = avgIncomePerHour > 0 ? remaining / avgIncomePerHour : 0;
@@ -1409,12 +1400,7 @@ function StatsPage({ statsSub, setStatsSub, months, selectedMonth, setSelectedMo
   const yearOf = selectedMonth.slice(0, 4);
   const yearMonths = allMonths.filter((m) => m.startsWith(yearOf));
   const yearHours = workDays.filter((w) => yearMonths.includes(monthKey(w.date))).reduce((s, w) => s + w.hours, 0);
-  const yearNet = yearMonths.reduce((s, m) => {
-    const mn = workDays.filter((w) => monthKey(w.date) === m).reduce((sum, w) => sum + w.net, 0);
-    const manualNet = manualNetSalaries[m];
-    const netForMonth = typeof manualNet === "number" ? manualNet : mn;
-    return s + netForMonth;
-  }, 0);
+  const yearNet = workDays.filter((w) => yearMonths.includes(monthKey(w.date))).reduce((s, w) => s + w.net, 0);
   const yearTips = tips.filter((t) => yearMonths.includes(t.month)).reduce((s, t) => s + t.amount, 0);
 
   const subTabs = [
@@ -1450,8 +1436,7 @@ function StatsPage({ statsSub, setStatsSub, months, selectedMonth, setSelectedMo
             <SectionTitle icon={Sparkles}>Salary Overview</SectionTitle>
             <div className="grid grid-cols-2 gap-3">
               <StatBlock label="Gross Salary" value={fmtEuro(gross)} accent={C.blueText} />
-              <StatBlock label="Net (auto)" value={fmtEuro(net)} accent={C.sageText} sub="after pension" />
-              <StatBlock label={hasManualEntry ? "Net (manual)" : "Net (final)"} value={fmtEuro(netFinal)} accent={C.sageText} sub={hasManualEntry ? "after all taxes" : undefined} />
+              <StatBlock label="Net Salary" value={fmtEuro(net)} accent={C.sageText} sub="after pension" />
               <StatBlock label="Tips" value={fmtEuro(tipsSum)} accent={C.honeyText} />
               <StatBlock label="Total Income" value={fmtEuro(total)} />
             </div>
@@ -1578,14 +1563,12 @@ function StatsPage({ statsSub, setStatsSub, months, selectedMonth, setSelectedMo
             const mDays = workDays.filter((w) => monthKey(w.date) === m);
             const mh = mDays.reduce((s, w) => s + w.hours, 0);
             const mn = mDays.reduce((s, w) => s + w.net, 0);
-            const manualNet = manualNetSalaries[m];
-            const mnAfterTax = typeof manualNet === "number" ? manualNet : mn;
             return (
               <Card key={m} className="flex items-center justify-between">
                 <span className="text-sm font-extrabold" style={{ color: C.ink, fontFamily: FONT_DISPLAY }}>{monthLabel(m)}</span>
                 <div className="flex gap-4 text-right">
                   <StatBlock label="Hours" value={formatHM(mh)} />
-                  <StatBlock label="Net" value={fmtEuro(mnAfterTax)} accent={C.sageText} />
+                  <StatBlock label="Net" value={fmtEuro(mn)} accent={C.sageText} />
                 </div>
               </Card>
             );
@@ -1609,7 +1592,7 @@ function StatsPage({ statsSub, setStatsSub, months, selectedMonth, setSelectedMo
 function PredictionPage({ settings, summary, monthWorkDays, selectedMonth, futureShifts, onAdd, onRemove, avgIncomePerHour }) {
   const [date, setDate] = useState(todayStr());
   const [start, setStart] = useState("17:00");
-  const [end, setEnd] = useState("22:00");
+  const [end, setEnd] = useState("22:30");
 
   const futureAsDays = futureShifts.map((f) => {
     const h = calcHoursDecimal(f.start, f.end, 0);
@@ -1631,7 +1614,7 @@ function PredictionPage({ settings, summary, monthWorkDays, selectedMonth, futur
       <Card className="mb-4">
         <SectionTitle icon={Sparkles}>Current — {monthLabel(selectedMonth)}</SectionTitle>
         <div className="grid grid-cols-2 gap-3">
-          <StatBlock label="Net (after your tax)" value={fmtEuro(summary.netFinal)} accent={C.sageText} />
+          <StatBlock label="Net Salary" value={fmtEuro(summary.net)} accent={C.sageText} />
           <StatBlock label="Hours" value={summary.totalHours.toFixed(2)} />
         </div>
       </Card>
@@ -1646,7 +1629,7 @@ function PredictionPage({ settings, summary, monthWorkDays, selectedMonth, futur
           <Field label="End"><StyledInput type="time" value={end} onChange={(e) => setEnd(e.target.value)} /></Field>
         </div>
         <PillButton onClick={() => onAdd({ date, start, end })} bg={C.blue} bgDeep={C.blueDeep} className="mt-1">
-          <Plus size={14} /> Add Shift
+          <Plus size={16} /> Add Shift
         </PillButton>
       </Card>
 
@@ -1762,7 +1745,10 @@ function SettingsPage({ settings, onSave }) {
 
       <Card className="mb-4">
         <SectionTitle icon={Target}>Goal</SectionTitle>
-        <Field label="Monthly goal (€)"><StyledInput type="number" step="1" value={form.monthlyGoal} onChange={(e) => update("monthlyGoal", Number(e.target.value))} /></Field>
+        <p className="text-xs mb-3" style={{ color: C.inkSoft }}>
+          Used as the fallback goal for any month that doesn't have its own custom goal. Set a custom goal for a specific month right on the Dashboard.
+        </p>
+        <Field label="Default monthly goal (€)"><StyledInput type="number" step="1" value={form.monthlyGoal} onChange={(e) => update("monthlyGoal", Number(e.target.value))} /></Field>
       </Card>
 
       <PillButton onClick={() => { onSave(form); setSaved(true); }} bg={C.pink} bgDeep={C.pinkDeep} className="w-full">
@@ -1783,7 +1769,7 @@ function SettingsPage({ settings, onSave }) {
 function AddWorkModal({ settings, onClose, onSave }) {
   const [date, setDate] = useState(todayStr());
   const [start, setStart] = useState("17:00");
-  const [end, setEnd] = useState("22:00");
+  const [end, setEnd] = useState("22:30");
   const [breakMin, setBreakMin] = useState(0);
 
   const hours = calcHoursDecimal(start, end, breakMin);
@@ -1871,34 +1857,6 @@ function ConfirmDeleteModal({ onCancel, onConfirm }) {
       <div className="grid grid-cols-2 gap-2">
         <PillButton onClick={onCancel} bg={C.cardAlt} bgDeep={C.line} text={C.ink}>Cancel</PillButton>
         <PillButton onClick={onConfirm} bg={C.red} bgDeep={C.redDeep}>Delete</PillButton>
-      </div>
-    </Modal>
-  );
-}
-
-function NetPayPromptModal({ month, currentValue, onSkip, onSave }) {
-  const [value, setValue] = useState(currentValue != null ? String(currentValue) : "");
-
-  return (
-    <Modal title={`Net Pay After Tax — ${monthLabel(month)}`} onClose={onSkip}>
-      <p className="text-xs mb-3" style={{ color: C.inkSoft }}>
-        If you know your after-tax net salary for {monthLabel(month)}, enter it now and it'll be saved as your "Net Salary (after all
-        taxes)" for the month. You can skip and update it later on the Dashboard.
-      </p>
-      <Field label="Net pay after tax">
-        <div className="flex items-center gap-2 rounded-2xl px-3 py-2" style={{ background: C.cardAlt, border: `2px solid ${C.line}` }}>
-          <span style={{ color: C.inkSoft }}>€</span>
-          <input
-            type="number" step="0.01" placeholder="0.00" value={value}
-            onChange={(e) => setValue(e.target.value)} autoFocus
-            className="w-full bg-transparent text-sm focus:outline-none"
-            style={{ color: C.ink }}
-          />
-        </div>
-      </Field>
-      <div className="grid grid-cols-2 gap-2 mt-1">
-        <PillButton onClick={onSkip} bg={C.cardAlt} bgDeep={C.line} text={C.ink}>Skip</PillButton>
-        <PillButton onClick={() => onSave(value)} bg={C.pink} bgDeep={C.pinkDeep}>Save</PillButton>
       </div>
     </Modal>
   );
