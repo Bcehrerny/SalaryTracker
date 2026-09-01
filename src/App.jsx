@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useMemo } from "react";
 import {
   Home, Clock, Coins, BarChart3, TrendingUp, Settings as SettingsIcon,
-  Plus, X, Trash2, ChevronLeft, ChevronRight, ChevronDown, Target, Pencil, Heart, Sparkles,
+  Plus, X, Trash2, ChevronLeft, ChevronRight, ChevronDown, Target, Pencil, Heart, Sparkles, AlertCircle,
 } from "lucide-react";
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
@@ -660,6 +660,7 @@ export default function App() {
   const [tips, setTips] = useState([]);
   const [futureShifts, setFutureShifts] = useState([]);
   const [monthlyGoals, setMonthlyGoals] = useState({});
+  const [afterTaxHeffingsloon, setAfterTaxHeffingsloon] = useState({}); // { "2026-07": 1334.87 } — heffingsloon minus loonheffing, from the real payslip
   const [tipPeriodRanges, setTipPeriodRanges] = useState({});
   const [tipEstimates, setTipEstimates] = useState([]);
   const [tab, setTab] = useState("dashboard");
@@ -686,6 +687,7 @@ export default function App() {
           setTipPeriodRanges(parsed.tipPeriodRanges || {});
           setTipEstimates(parsed.tipEstimates || []);
           setMonthlyGoals(parsed.monthlyGoals || {});
+          setAfterTaxHeffingsloon(parsed.afterTaxHeffingsloon || {});
         }
       } catch (e) {
         // no existing data yet
@@ -702,6 +704,7 @@ export default function App() {
         tips: next.tips ?? tips,
         futureShifts: next.futureShifts ?? futureShifts,
         monthlyGoals: next.monthlyGoals ?? monthlyGoals,
+        afterTaxHeffingsloon: next.afterTaxHeffingsloon ?? afterTaxHeffingsloon,
         tipPeriodRanges: next.tipPeriodRanges ?? tipPeriodRanges,
         tipEstimates: next.tipEstimates ?? tipEstimates,
       };
@@ -778,6 +781,13 @@ export default function App() {
     setFutureShifts(next);
     persist({ futureShifts: next });
   }
+  function setAfterTaxForMonth(month, value) {
+    const next = { ...afterTaxHeffingsloon };
+    if (value === "" || isNaN(Number(value))) delete next[month];
+    else next[month] = Number(value);
+    setAfterTaxHeffingsloon(next);
+    persist({ afterTaxHeffingsloon: next });
+  }
   function setGoalForMonth(month, value) {
     const next = { ...monthlyGoals };
     if (value === "" || isNaN(Number(value))) delete next[month];
@@ -822,8 +832,19 @@ export default function App() {
   const summary = useMemo(() => {
     const mp = payInfo.byMonth[selectedMonth] || emptyMonthPay();
     const tipsSum = monthTips.reduce((s, t) => s + t.amount, 0);
-    return { totalHours: mp.loonuren, gross: mp.bruto, net: mp.netBeforeTax, monthPay: mp, tipsSum, total: mp.netBeforeTax + tipsSum };
-  }, [payInfo, selectedMonth, monthTips]);
+    // The user enters the after-tax heffingsloon from the real payslip;
+    // loonheffing follows from it. Until entered, loonheffing counts as €0.
+    const afterTax = afterTaxHeffingsloon[selectedMonth];
+    const hasTaxEntry = typeof afterTax === "number";
+    const loonheffing = hasTaxEntry ? r2(mp.heffingsloon - afterTax) : 0;
+    const netFinal = r2(mp.netBeforeTax - loonheffing);
+    return {
+      totalHours: mp.loonuren, gross: mp.bruto, net: mp.netBeforeTax,
+      heffingsloon: mp.heffingsloon, monthPay: mp,
+      afterTax, hasTaxEntry, loonheffing, netFinal,
+      tipsSum, total: netFinal + tipsSum,
+    };
+  }, [payInfo, selectedMonth, monthTips, afterTaxHeffingsloon]);
 
   const avgIncomePerHour = useMemo(() => {
     if (summary.totalHours > 0) return summary.total / summary.totalHours;
@@ -878,6 +899,7 @@ export default function App() {
             onEditWork={setEditingWorkDay}
             onDeleteWork={setConfirmDeleteId}
             onSetGoal={(val) => setGoalForMonth(selectedMonth, val)}
+            onSetAfterTax={(val) => setAfterTaxForMonth(selectedMonth, val)}
           />
         )}
 
@@ -1065,7 +1087,7 @@ function PayslipLine({ label, value, bold = false, negative = false, final = fal
 /* ---------- Dashboard ---------- */
 function Dashboard({
   months, selectedMonth, setSelectedMonth, summary, settings, monthlyGoals,
-  monthWorkDays, monthTips, avgIncomePerHour, onAddWork, onGoToTips, onEditWork, onDeleteWork, onSetGoal,
+  monthWorkDays, monthTips, avgIncomePerHour, onAddWork, onGoToTips, onEditWork, onDeleteWork, onSetGoal, onSetAfterTax,
 }) {
   const hasCustomGoal = typeof monthlyGoals[selectedMonth] === "number";
   const goal = hasCustomGoal ? monthlyGoals[selectedMonth] : settings.monthlyGoal;
@@ -1075,9 +1097,14 @@ function Dashboard({
 
   const [payslipOpen, setPayslipOpen] = useState(false);
   const [goalInput, setGoalInput] = useState(hasCustomGoal ? String(monthlyGoals[selectedMonth]) : "");
+  const [afterTaxInput, setAfterTaxInput] = useState(summary.hasTaxEntry ? String(summary.afterTax) : "");
   useEffect(() => {
     setGoalInput(typeof monthlyGoals[selectedMonth] === "number" ? String(monthlyGoals[selectedMonth]) : "");
+    setAfterTaxInput(summary.hasTaxEntry ? String(summary.afterTax) : "");
   }, [selectedMonth]); // eslint-disable-line
+
+  // Warn until the after-tax number is entered for a month that has logs.
+  const needsTaxEntry = summary.totalHours > 0 && !summary.hasTaxEntry;
 
   const recent = useMemo(() => {
     return [...monthWorkDays].sort((a, b) => b.date.localeCompare(a.date)).slice(0, 6);
@@ -1101,8 +1128,8 @@ function Dashboard({
 
       <div className="grid grid-cols-2 gap-3 mb-4">
         <Card><StatBlock label="Worked Hours" value={formatHM(summary.totalHours)} /></Card>
-        <Card><StatBlock label="Gross Salary" value={fmtEuro(summary.gross)} accent={C.blueText} /></Card>
         <Card><StatBlock label="Net" value={fmtEuro(summary.net)} accent={C.sageText} /></Card>
+        <Card><StatBlock label="Heffingsloon" value={fmtEuro(summary.heffingsloon)} accent={C.blueText} /></Card>
         <Card><StatBlock label="Tips" value={fmtEuro(summary.tipsSum)} accent={C.honeyText} /></Card>
       </div>
 
@@ -1120,9 +1147,10 @@ function Dashboard({
             </span>
           </div>
           <div className="flex items-center gap-2">
+            {needsTaxEntry && <AlertCircle size={15} style={{ color: C.roseDeep }} />}
             {!payslipOpen && (
               <span className="text-xs font-extrabold tabular-nums" style={{ color: C.sageText, fontFamily: FONT_DISPLAY }}>
-                {fmtEuro(summary.monthPay.netBeforeTax)}
+                {fmtEuro(summary.hasTaxEntry ? summary.netFinal : summary.monthPay.netBeforeTax)}
               </span>
             )}
             <ChevronDown
@@ -1151,12 +1179,49 @@ function Dashboard({
                 negative
                 bold
               />
-              <PayslipLine label="Netto (voor loonheffing)" value={summary.monthPay.netBeforeTax} bold final />
+              <PayslipLine label="Netto (voor loonheffing)" value={summary.monthPay.netBeforeTax} bold final={!summary.hasTaxEntry} />
             </div>
+
+            <div className="mt-3 rounded-2xl p-3" style={{ background: C.cardAlt, border: `1.5px solid ${needsTaxEntry ? `${C.rose}66` : C.line}` }}>
+              <div className="flex items-center gap-1.5 mb-1">
+                {needsTaxEntry && <AlertCircle size={13} style={{ color: C.roseDeep }} />}
+                <span className="text-[11px] font-bold" style={{ color: needsTaxEntry ? C.roseDeep : C.inkSoft }}>
+                  Heffingsloon after loonheffing (from your payslip)
+                </span>
+              </div>
+              <div className="flex items-center gap-2">
+                <span style={{ color: C.inkSoft }}>€</span>
+                <input
+                  type="number"
+                  step="0.01"
+                  placeholder={fmtEuro(summary.heffingsloon).slice(1)}
+                  value={afterTaxInput}
+                  onChange={(e) => {
+                    setAfterTaxInput(e.target.value);
+                    onSetAfterTax(e.target.value);
+                  }}
+                  className="w-full bg-transparent text-base font-extrabold tabular-nums focus:outline-none"
+                  style={{ color: summary.hasTaxEntry ? C.sageText : C.roseDeep, fontFamily: FONT_DISPLAY }}
+                />
+              </div>
+              {summary.hasTaxEntry ? (
+                <div className="flex flex-col gap-1 text-xs tabular-nums mt-2" style={{ color: C.ink }}>
+                  <PayslipLine label="Loonheffing (derived)" value={-summary.loonheffing} negative />
+                  <PayslipLine label="Netto (na loonheffing)" value={summary.netFinal} bold final />
+                </div>
+              ) : (
+                <p className="text-[11px] mt-1.5" style={{ color: C.roseDeep }}>
+                  Not entered yet — showing heffingsloon ({fmtEuro(summary.heffingsloon)}) as the
+                  default, which assumes €0 loonheffing. When the payslip arrives, enter
+                  heffingsloon minus loonheffing here.
+                </p>
+              )}
+            </div>
+
             <p className="text-[11px] mt-2" style={{ color: C.inkSoft }}>
               Matches the payslip line by line — heffingsloon {fmtEuro(summary.monthPay.heffingsloon)},{" "}
-              {summary.monthPay.verloondeUren} verloonde uren. Loonheffing comes from the official tax
-              tables, so the payslip's final netto will be this minus loonheffing.
+              {summary.monthPay.verloondeUren} verloonde uren. Total Earned = net −
+              (heffingsloon − the amount above) + tips.
             </p>
           </div>
         )}
