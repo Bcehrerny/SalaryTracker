@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useMemo } from "react";
 import {
   Home, Clock, Coins, BarChart3, TrendingUp, Settings as SettingsIcon,
-  Plus, X, Trash2, ChevronLeft, ChevronRight, Target, Pencil, Heart, Sparkles,
+  Plus, X, Trash2, ChevronLeft, ChevronRight, ChevronDown, Target, Pencil, Heart, Sparkles,
 } from "lucide-react";
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
@@ -95,11 +95,14 @@ const STORAGE_KEY_ = STORAGE_KEY; // keep name stable
 const DEFAULT_SETTINGS = {
   rateHistory: [
     { date: "2026-01-01", rate: 14.71 },
-    { date: "2026-07-01", rate: 14.99 },
+    { date: "2026-07-01", rate: 15.05 },
   ],
-  vakantieurenPct: 10.64,
-  vakantiegeldPct: 8,
-  pensionBasisPct: 55.91,
+  vakantieurenPct: 10.64, // "Res. Vrije Dagen" reservation, paid out monthly
+  vakantiegeldPct: 8, // applied to (loon + vrije dagen) => effectively 8.8512% of base
+  franchisePerHour: 7.746964, // PH&C 2026: €15,308/yr ÷ 1976 h (horeca); changes every January
+  mealNormPerDay: 4.05, // fiscal normbedrag maaltijd 2026, charged per loondag
+  fullDayHours: 7.6, // 1 loondag = 7.6 loonuren
+  pensionResetMonth: "2026-06", // employer change: cumulative (VCR) pension restarts here
   ouderdomspensioenPct: 8.4,
   nabestaandenpensioenPct: 0.17,
   wgaPct: 0.44,
@@ -128,9 +131,29 @@ function migrateSettings(raw) {
       merged.rateHistory = DEFAULT_SETTINGS.rateHistory;
     }
   }
+  // The old default July rate (14.99) predates the payslip, which shows 15.05.
+  merged.rateHistory = merged.rateHistory.map((r) =>
+    r.date === "2026-07-01" && r.rate === 14.99 ? { ...r, rate: 15.05 } : r
+  );
   delete merged.hourlyRate;
   delete merged.pensionPct;
+  delete merged.pensionBasisPct; // replaced by the franchise model
   return merged;
+}
+
+// Work days are stored as raw inputs only; pay is always derived from the
+// current settings, so settings changes automatically apply everywhere.
+function migrateWorkDay(w) {
+  const row = {
+    id: w.id || uid(),
+    date: w.date,
+    start: w.start,
+    end: w.end,
+    breakMin: Number(w.breakMin) || 0,
+  };
+  // Legacy rows without start/end keep their stored hours as a fallback.
+  if ((!w.start || !w.end) && typeof w.hours === "number") row.hours = w.hours;
+  return row;
 }
 
 /* ---------- helpers (unchanged business logic) ---------- */
@@ -155,19 +178,117 @@ function formatHM(hoursDecimal) {
   const m = totalMin % 60;
   return `${h}h${m.toString().padStart(2, "0")}m`;
 }
-function calcPay(hours, rate, settings) {
-  const base = hours * rate;
-  const vakantieurenAmt = base * (settings.vakantieurenPct / 100);
-  const vakantiegeldAmt = base * (settings.vakantiegeldPct / 100);
-  const gross = base + vakantieurenAmt + vakantiegeldAmt;
+function r2(n) {
+  return Math.round((n || 0) * 100) / 100;
+}
+function shiftHours(w) {
+  if (w.start && w.end) return calcHoursDecimal(w.start, w.end, w.breakMin);
+  return w.hours || 0;
+}
 
-  const pensionBasis = gross * (settings.pensionBasisPct / 100);
-  const deductionPctSum =
-    settings.ouderdomspensioenPct + settings.nabestaandenpensioenPct + settings.wgaPct + settings.premieHopPct;
-  const deductions = pensionBasis * (deductionPctSum / 100);
+/* ---------- pay engine ----------
+   Reproduces the payslip exactly. Per month:
+     loon          = Σ (shift hours × rate on that date)
+     vrijeDagen    = loon × 10.64%                 ("Meeruren 10,64% Res. Vrije Dagen")
+     vakantiegeld  = (loon + vrijeDagen) × 8%      (effectively 8.8512% of loon)
+     loondagen     = loonuren ÷ 7.6  (rounded to 2 dp)
+     maaltijd      = loondagen × €4.05             (added to gross AND deducted from net)
+     bruto         = loon + vrijeDagen + vakantiegeld + maaltijd
+     verloondeUren = ⌈loonuren × 1.1064⌉           (rounded up to whole hours)
+   Ouderdomspensioen uses the PH&C franchise, cumulative (VCR) per employer:
+     cumGrondslag  = Σbruto − franchise × ΣverloondeUren
+     OP this month = cumGrondslag × 8.4% − OP already paid
+   NP = bruto × 0.17%;  HOP = bruto × 0.1%
+   heffingsloon = bruto − OP − NP − HOP;  WGA = heffingsloon × 0.44%
+   netBeforeTax = bruto − OP − NP − HOP − WGA − maaltijd  (loonheffing not predicted) */
+function emptyMonthPay() {
+  return {
+    loonuren: 0, loon: 0, vrijeDagen: 0, vakantiegeld: 0, loondagen: 0,
+    maaltijd: 0, bruto: 0, verloondeUren: 0, op: 0, np: 0, hop: 0,
+    heffingsloon: 0, wga: 0, netBeforeTax: 0,
+  };
+}
 
-  const net = gross - deductions;
-  return { base, vakantieurenAmt, vakantiegeldAmt, gross, pensionBasis, deductions, net };
+function computeMonthlyPay(workDays, settings) {
+  const s = settings;
+  const byMonthShifts = {};
+  for (const w of workDays) {
+    const m = monthKey(w.date);
+    if (!byMonthShifts[m]) byMonthShifts[m] = [];
+    byMonthShifts[m].push(w);
+  }
+  const monthsSorted = Object.keys(byMonthShifts).sort();
+  const byMonth = {};
+  const byShift = {};
+
+  const resetMonth = s.pensionResetMonth || "";
+  let chain = null;
+  let cumBruto = 0, cumUren = 0, cumOP = 0;
+
+  for (const m of monthsSorted) {
+    // The cumulative pension chain restarts when you change employer.
+    const thisChain = resetMonth && m >= resetMonth ? "current" : "previous";
+    if (thisChain !== chain) {
+      chain = thisChain;
+      cumBruto = 0; cumUren = 0; cumOP = 0;
+    }
+
+    let loonuren = 0;
+    let loon = 0;
+    const bases = [];
+    for (const w of byMonthShifts[m]) {
+      const h = shiftHours(w);
+      const rate = getRateForDate(s.rateHistory, w.date);
+      const base = h * rate;
+      loonuren += h;
+      loon += base;
+      bases.push({ id: w.id, base });
+    }
+    loon = r2(loon);
+
+    const vrijeDagen = r2(loon * s.vakantieurenPct / 100);
+    const vakantiegeld = r2((loon + vrijeDagen) * s.vakantiegeldPct / 100);
+    const loondagen = r2(loonuren / (s.fullDayHours || 7.6));
+    const maaltijd = r2(loondagen * (s.mealNormPerDay || 0));
+    const bruto = r2(loon + vrijeDagen + vakantiegeld + maaltijd);
+    const verloondeUren = Math.ceil(r2(loonuren * (1 + s.vakantieurenPct / 100)) - 1e-9);
+
+    cumBruto = r2(cumBruto + bruto);
+    cumUren += verloondeUren;
+    const cumGrondslag = Math.max(0, r2(cumBruto - (s.franchisePerHour || 0) * cumUren));
+    const newCumOP = r2(cumGrondslag * s.ouderdomspensioenPct / 100);
+    const op = r2(newCumOP - cumOP);
+    cumOP = newCumOP;
+
+    const np = r2(bruto * s.nabestaandenpensioenPct / 100);
+    const hop = r2(bruto * s.premieHopPct / 100);
+    const heffingsloon = r2(bruto - op - np - hop);
+    const wga = r2(heffingsloon * s.wgaPct / 100);
+    const netBeforeTax = r2(bruto - op - np - hop - wga - maaltijd);
+
+    byMonth[m] = {
+      loonuren, loon, vrijeDagen, vakantiegeld, loondagen, maaltijd,
+      bruto, verloondeUren, op, np, hop, heffingsloon, wga, netBeforeTax,
+    };
+
+    // Allocate month totals back to shifts (proportional to base pay) so
+    // per-day views have sensible numbers that sum to the month exactly.
+    for (const b of bases) {
+      const share = loon > 0 ? b.base / loon : 0;
+      byShift[b.id] = { gross: r2(bruto * share), net: r2(netBeforeTax * share) };
+    }
+  }
+  return { byMonth, byShift };
+}
+
+// Marginal effect of adding/replacing one shift on its month (used by the
+// Add/Edit modals so the preview includes vakantiegeld, meal and pension).
+function marginalShiftPay(workDays, settings, candidate, replaceId) {
+  const others = replaceId ? workDays.filter((w) => w.id !== replaceId) : workDays;
+  const m = monthKey(candidate.date);
+  const withNew = computeMonthlyPay([...others, candidate], settings).byMonth[m] || emptyMonthPay();
+  const without = computeMonthlyPay(others, settings).byMonth[m] || emptyMonthPay();
+  return { gross: r2(withNew.bruto - without.bruto), net: r2(withNew.netBeforeTax - without.netBeforeTax) };
 }
 function fmtEuro(n) {
   const v = Math.round((n || 0) * 100) / 100;
@@ -557,7 +678,9 @@ export default function App() {
         if (res && res.value) {
           const parsed = JSON.parse(res.value);
           setSettings(migrateSettings(parsed.settings));
-          setWorkDays(parsed.workDays || []);
+          // Strip cached gross/net/rate from old rows; pay is now always
+          // derived live from settings, so old logs update automatically.
+          setWorkDays((parsed.workDays || []).map(migrateWorkDay));
           setTips(migrateTips(parsed.tips));
           setFutureShifts(parsed.futureShifts || []);
           setTipPeriodRanges(parsed.tipPeriodRanges || {});
@@ -604,10 +727,8 @@ export default function App() {
   }
 
   function addWorkDay(entry) {
-    const hours = calcHoursDecimal(entry.date && entry.start, entry.end, entry.breakMin);
-    const rate = getRateForDate(settings.rateHistory, entry.date);
-    const { gross, net } = calcPay(hours, rate, settings);
-    const row = { id: uid(), date: entry.date, start: entry.start, end: entry.end, breakMin: Number(entry.breakMin) || 0, hours, rate, gross, net };
+    // Raw inputs only — everything else is derived from current settings.
+    const row = { id: uid(), date: entry.date, start: entry.start, end: entry.end, breakMin: Number(entry.breakMin) || 0 };
     const next = [...workDays, row].sort((a, b) => a.date.localeCompare(b.date));
     setWorkDays(next);
     persist({ workDays: next });
@@ -618,10 +739,7 @@ export default function App() {
     persist({ workDays: next });
   }
   function updateWorkDay(updated) {
-    const hours = calcHoursDecimal(updated.date && updated.start, updated.end, updated.breakMin);
-    const rate = getRateForDate(settings.rateHistory, updated.date);
-    const { gross, net } = calcPay(hours, rate, settings);
-    const row = { ...updated, breakMin: Number(updated.breakMin) || 0, hours, rate, gross, net };
+    const row = migrateWorkDay(updated);
     const next = workDays.map((w) => (w.id === row.id ? row : w)).sort((a, b) => a.date.localeCompare(b.date));
     setWorkDays(next);
     persist({ workDays: next });
@@ -681,7 +799,20 @@ export default function App() {
     if (!months.includes(selectedMonth) && months.length) setSelectedMonth(months[months.length - 1]);
   }, [months]); // eslint-disable-line
 
-  const monthWorkDays = useMemo(() => workDays.filter((w) => monthKey(w.date) === selectedMonth), [workDays, selectedMonth]);
+  // ---- derived pay: recomputed whenever workDays OR settings change ----
+  const payInfo = useMemo(() => computeMonthlyPay(workDays, settings), [workDays, settings]);
+  const decoratedDays = useMemo(
+    () =>
+      workDays.map((w) => {
+        const hours = shiftHours(w);
+        const rate = getRateForDate(settings.rateHistory, w.date);
+        const alloc = payInfo.byShift[w.id] || { gross: r2(hours * rate), net: r2(hours * rate) };
+        return { ...w, hours, rate, gross: alloc.gross, net: alloc.net };
+      }),
+    [workDays, settings, payInfo]
+  );
+
+  const monthWorkDays = useMemo(() => decoratedDays.filter((w) => monthKey(w.date) === selectedMonth), [decoratedDays, selectedMonth]);
   const monthTips = useMemo(() => tips.filter((t) => t.month === selectedMonth), [tips, selectedMonth]);
   const monthEstimates = useMemo(
     () => tipEstimates.filter((e) => monthKey(e.date) === selectedMonth),
@@ -689,17 +820,18 @@ export default function App() {
   );
 
   const summary = useMemo(() => {
-    const totalHours = monthWorkDays.reduce((s, d) => s + d.hours, 0);
-    const gross = monthWorkDays.reduce((s, d) => s + d.gross, 0);
-    const net = monthWorkDays.reduce((s, d) => s + d.net, 0);
+    const mp = payInfo.byMonth[selectedMonth] || emptyMonthPay();
     const tipsSum = monthTips.reduce((s, t) => s + t.amount, 0);
-    return { totalHours, gross, net, tipsSum, total: net + tipsSum };
-  }, [monthWorkDays, monthTips]);
+    return { totalHours: mp.loonuren, gross: mp.bruto, net: mp.netBeforeTax, monthPay: mp, tipsSum, total: mp.netBeforeTax + tipsSum };
+  }, [payInfo, selectedMonth, monthTips]);
 
-  const avgIncomePerHour =
-    summary.totalHours > 0
-      ? summary.total / summary.totalHours
-      : calcPay(1, getRateForDate(settings.rateHistory, todayStr()), settings).net;
+  const avgIncomePerHour = useMemo(() => {
+    if (summary.totalHours > 0) return summary.total / summary.totalHours;
+    // Fallback: net/hour of a synthetic 1-hour shift under current settings.
+    const probe = computeMonthlyPay([{ id: "probe", date: todayStr(), hours: 1 }], settings);
+    const mp = probe.byMonth[monthKey(todayStr())];
+    return mp ? mp.netBeforeTax : 0;
+  }, [summary, settings]);
 
   if (!loaded) {
     return (
@@ -789,7 +921,7 @@ export default function App() {
             months={months}
             selectedMonth={selectedMonth}
             setSelectedMonth={setSelectedMonth}
-            workDays={workDays}
+            workDays={decoratedDays}
             tips={tips}
             settings={settings}
             monthlyGoals={monthlyGoals}
@@ -801,7 +933,7 @@ export default function App() {
           <PredictionPage
             settings={settings}
             summary={summary}
-            monthWorkDays={monthWorkDays}
+            workDays={workDays}
             selectedMonth={selectedMonth}
             futureShifts={futureShifts}
             onAdd={addFutureShift}
@@ -818,6 +950,7 @@ export default function App() {
       {showAddWork && (
         <AddWorkModal
           settings={settings}
+          workDays={workDays}
           onClose={() => setShowAddWork(false)}
           onSave={(entry) => {
             addWorkDay(entry);
@@ -844,6 +977,7 @@ export default function App() {
       {editingWorkDay && (
         <EditWorkModal
           settings={settings}
+          workDays={workDays}
           entry={editingWorkDay}
           onClose={() => setEditingWorkDay(null)}
           onSave={(updated) => {
@@ -909,6 +1043,25 @@ function BottomNav({ tab, setTab }) {
   );
 }
 
+function PayslipLine({ label, value, bold = false, negative = false, final = false }) {
+  return (
+    <div
+      className="flex items-baseline justify-between gap-2"
+      style={bold ? { borderTop: `1.5px dashed ${C.line}`, paddingTop: 4, marginTop: 2 } : {}}
+    >
+      <span className={bold ? "font-extrabold" : ""} style={{ color: bold ? C.ink : C.inkSoft, fontFamily: bold ? FONT_DISPLAY : FONT_BODY }}>
+        {label}
+      </span>
+      <span
+        className={bold ? "font-extrabold" : "font-bold"}
+        style={{ color: final ? C.sageText : negative ? C.roseDeep : C.ink, fontFamily: FONT_DISPLAY }}
+      >
+        {value < 0 ? `− ${fmtEuro(Math.abs(value))}` : fmtEuro(value)}
+      </span>
+    </div>
+  );
+}
+
 /* ---------- Dashboard ---------- */
 function Dashboard({
   months, selectedMonth, setSelectedMonth, summary, settings, monthlyGoals,
@@ -920,6 +1073,7 @@ function Dashboard({
   const remaining = Math.max(goal - summary.total, 0);
   const hoursNeeded = avgIncomePerHour > 0 ? remaining / avgIncomePerHour : 0;
 
+  const [payslipOpen, setPayslipOpen] = useState(false);
   const [goalInput, setGoalInput] = useState(hasCustomGoal ? String(monthlyGoals[selectedMonth]) : "");
   useEffect(() => {
     setGoalInput(typeof monthlyGoals[selectedMonth] === "number" ? String(monthlyGoals[selectedMonth]) : "");
@@ -951,6 +1105,62 @@ function Dashboard({
         <Card><StatBlock label="Net" value={fmtEuro(summary.net)} accent={C.sageText} /></Card>
         <Card><StatBlock label="Tips" value={fmtEuro(summary.tipsSum)} accent={C.honeyText} /></Card>
       </div>
+
+      <Card className="mb-4" accent={C.blue}>
+        <button
+          type="button"
+          onClick={() => setPayslipOpen((o) => !o)}
+          className="w-full flex items-center justify-between"
+          aria-expanded={payslipOpen}
+        >
+          <div className="flex items-center gap-2">
+            <Coins size={15} style={{ color: C.blueText }} />
+            <span className="text-sm font-extrabold" style={{ color: C.ink, fontFamily: FONT_DISPLAY }}>
+              Payslip Preview
+            </span>
+          </div>
+          <div className="flex items-center gap-2">
+            {!payslipOpen && (
+              <span className="text-xs font-extrabold tabular-nums" style={{ color: C.sageText, fontFamily: FONT_DISPLAY }}>
+                {fmtEuro(summary.monthPay.netBeforeTax)}
+              </span>
+            )}
+            <ChevronDown
+              size={16}
+              style={{ color: C.inkSoft, transition: "transform 0.25s ease", transform: payslipOpen ? "rotate(180deg)" : "rotate(0deg)" }}
+            />
+          </div>
+        </button>
+
+        {payslipOpen && (
+          <div className="mt-3">
+            <div className="flex flex-col gap-1 text-xs tabular-nums" style={{ color: C.ink }}>
+              <PayslipLine label={`Loon (${summary.monthPay.loonuren.toFixed(2)} u)`} value={summary.monthPay.loon} />
+              <PayslipLine label={`Res. vrije dagen ${settings.vakantieurenPct}%`} value={summary.monthPay.vrijeDagen} />
+              <PayslipLine label={`Vakantiegeld ${settings.vakantiegeldPct}%`} value={summary.monthPay.vakantiegeld} />
+              <PayslipLine label={`Maaltijd (${summary.monthPay.loondagen.toFixed(2)} dg)`} value={summary.monthPay.maaltijd} />
+              <PayslipLine label="Bruto loon" value={summary.monthPay.bruto} bold />
+              <PayslipLine label={`Ouderdomspensioen ${settings.ouderdomspensioenPct}%`} value={-summary.monthPay.op} negative />
+              <PayslipLine label={`Nabestaandenpensioen ${settings.nabestaandenpensioenPct}%`} value={-summary.monthPay.np} negative />
+              <PayslipLine label={`W.G.A. ${settings.wgaPct}%`} value={-summary.monthPay.wga} negative />
+              <PayslipLine label={`Premie HOP ${settings.premieHopPct}%`} value={-summary.monthPay.hop} negative />
+              <PayslipLine label="Maaltijd" value={-summary.monthPay.maaltijd} negative />
+              <PayslipLine
+                label="Inhoudingen totaal"
+                value={-(r2(summary.monthPay.op + summary.monthPay.np + summary.monthPay.wga + summary.monthPay.hop + summary.monthPay.maaltijd))}
+                negative
+                bold
+              />
+              <PayslipLine label="Netto (voor loonheffing)" value={summary.monthPay.netBeforeTax} bold final />
+            </div>
+            <p className="text-[11px] mt-2" style={{ color: C.inkSoft }}>
+              Matches the payslip line by line — heffingsloon {fmtEuro(summary.monthPay.heffingsloon)},{" "}
+              {summary.monthPay.verloondeUren} verloonde uren. Loonheffing comes from the official tax
+              tables, so the payslip's final netto will be this minus loonheffing.
+            </p>
+          </div>
+        )}
+      </Card>
 
       <Card className="mb-4" accent={C.pink}>
         <div className="flex items-center justify-between mb-2">
@@ -1589,25 +1799,28 @@ function StatsPage({ statsSub, setStatsSub, months, selectedMonth, setSelectedMo
 }
 
 /* ---------- Prediction ---------- */
-function PredictionPage({ settings, summary, monthWorkDays, selectedMonth, futureShifts, onAdd, onRemove, avgIncomePerHour }) {
+function PredictionPage({ settings, summary, workDays, selectedMonth, futureShifts, onAdd, onRemove }) {
   const [date, setDate] = useState(todayStr());
   const [start, setStart] = useState("17:00");
   const [end, setEnd] = useState("22:30");
 
-  const futureAsDays = futureShifts.map((f) => {
-    const h = calcHoursDecimal(f.start, f.end, 0);
-    const rate = getRateForDate(settings.rateHistory, f.date);
-    const { gross, net } = calcPay(h, rate, settings);
-    return { hours: h, rate, gross, net };
-  });
-  const addedHours = futureAsDays.reduce((s, d) => s + d.hours, 0);
-  const addedNet = futureAsDays.reduce((s, d) => s + d.net, 0);
+  // Project the month by running the real pay engine over logged + future
+  // shifts together, so vakantiegeld, meal and the cumulative pension are
+  // all as accurate as the payslip.
+  const projected = useMemo(() => {
+    const futureRows = futureShifts.map((f) => ({ id: "future_" + f.id, date: f.date, start: f.start, end: f.end, breakMin: 0 }));
+    const pay = computeMonthlyPay([...workDays, ...futureRows], settings);
+    return pay.byMonth[selectedMonth] || emptyMonthPay();
+  }, [workDays, futureShifts, settings, selectedMonth]);
+
+  const addedHours = Math.max(0, projected.loonuren - summary.totalHours);
+  const addedNet = r2(projected.netBeforeTax - summary.net);
   const tipRatePerHour = summary.totalHours > 0 ? summary.tipsSum / summary.totalHours : 0;
   const estimatedTips = tipRatePerHour * addedHours;
 
-  const projHours = summary.totalHours + addedHours;
+  const projHours = projected.loonuren;
   const projTipsTotal = summary.tipsSum + estimatedTips;
-  const projectedTotal = summary.total + addedNet + estimatedTips;
+  const projectedTotal = projected.netBeforeTax + projTipsTotal;
 
   return (
     <div>
@@ -1667,15 +1880,32 @@ function PredictionPage({ settings, summary, monthWorkDays, selectedMonth, futur
 }
 
 /* ---------- Settings ---------- */
+const NUMERIC_SETTINGS = [
+  "vakantieurenPct", "vakantiegeldPct", "franchisePerHour", "mealNormPerDay",
+  "fullDayHours", "ouderdomspensioenPct", "nabestaandenpensioenPct",
+  "wgaPct", "premieHopPct", "monthlyGoal",
+];
+
 function SettingsPage({ settings, onSave }) {
-  const [form, setForm] = useState(settings);
-  const [saved, setSaved] = useState(false);
+  // Numeric fields are kept as strings while editing; every valid change is
+  // saved immediately and recalculates all logged months automatically.
+  const [form, setForm] = useState(() => {
+    const f = { ...settings };
+    NUMERIC_SETTINGS.forEach((k) => (f[k] = String(settings[k] ?? "")));
+    return f;
+  });
   const [newRateDate, setNewRateDate] = useState(todayStr());
   const [newRateValue, setNewRateValue] = useState("");
 
   function update(key, value) {
-    setForm({ ...form, [key]: value });
-    setSaved(false);
+    const nextForm = { ...form, [key]: value };
+    setForm(nextForm);
+    const next = { ...settings, rateHistory: nextForm.rateHistory, pensionResetMonth: nextForm.pensionResetMonth };
+    NUMERIC_SETTINGS.forEach((k) => {
+      const n = Number(nextForm[k]);
+      if (nextForm[k] !== "" && Number.isFinite(n)) next[k] = n;
+    });
+    onSave(next);
   }
 
   const sortedRates = [...form.rateHistory].sort((a, b) => b.date.localeCompare(a.date));
@@ -1694,6 +1924,9 @@ function SettingsPage({ settings, onSave }) {
 
   return (
     <div>
+      <div className="mb-4 text-xs font-bold rounded-2xl px-3 py-2" style={{ color: C.sageText, background: `${C.sage}22`, border: `2px solid ${C.sage}55` }}>
+        Changes save automatically and instantly recalculate every logged month. 🍒
+      </div>
       <Card className="mb-4">
         <SectionTitle icon={Coins}>Pay Rates</SectionTitle>
         <p className="text-xs mb-3" style={{ color: C.inkSoft }}>
@@ -1717,7 +1950,7 @@ function SettingsPage({ settings, onSave }) {
         <div className="grid grid-cols-2 gap-2 mb-2">
           <Field label="Effective from"><StyledInput type="date" value={newRateDate} onChange={(e) => setNewRateDate(e.target.value)} /></Field>
           <Field label="New rate (€/h)">
-            <StyledInput type="number" step="0.01" value={newRateValue} onChange={(e) => setNewRateValue(e.target.value)} placeholder="14.99" />
+            <StyledInput type="number" step="0.01" value={newRateValue} onChange={(e) => setNewRateValue(e.target.value)} placeholder="15.05" />
           </Field>
         </div>
         <PillButton onClick={addRate} bg={C.blue} bgDeep={C.blueDeep} className="py-2">
@@ -1727,20 +1960,40 @@ function SettingsPage({ settings, onSave }) {
 
       <Card className="mb-4">
         <SectionTitle icon={SettingsIcon}>Pay Rules</SectionTitle>
-        <Field label="Vakantieuren (%)"><StyledInput type="number" step="0.01" value={form.vakantieurenPct} onChange={(e) => update("vakantieurenPct", Number(e.target.value))} /></Field>
-        <Field label="Vakantiegeld (%)"><StyledInput type="number" step="0.01" value={form.vakantiegeldPct} onChange={(e) => update("vakantiegeldPct", Number(e.target.value))} /></Field>
+        <Field label="Vakantieuren (%)"><StyledInput type="number" step="0.01" value={form.vakantieurenPct} onChange={(e) => update("vakantieurenPct", e.target.value)} /></Field>
+        <Field label="Vakantiegeld (%) — applied to loon + vrije dagen"><StyledInput type="number" step="0.01" value={form.vakantiegeldPct} onChange={(e) => update("vakantiegeldPct", e.target.value)} /></Field>
+        <div className="grid grid-cols-2 gap-2">
+          <Field label="Meal charge (€/loondag)"><StyledInput type="number" step="0.01" value={form.mealNormPerDay} onChange={(e) => update("mealNormPerDay", e.target.value)} /></Field>
+          <Field label="Hours per loondag"><StyledInput type="number" step="0.1" value={form.fullDayHours} onChange={(e) => update("fullDayHours", e.target.value)} /></Field>
+        </div>
+        <p className="text-xs" style={{ color: C.inkSoft }}>
+          Maaltijd = meal charge × (hours ÷ hours per loondag). It's added to gross and deducted
+          from net, so it barely affects your cash — the fiscal normbedrag is €4.05 in 2026.
+        </p>
       </Card>
 
       <Card className="mb-4">
         <SectionTitle icon={Sparkles}>Pension &amp; Deductions</SectionTitle>
-        <p className="text-xs mb-3" style={{ color: C.inkSoft }}>The four rates below are applied to the pension basis, not directly to gross pay.</p>
-        <Field label="Pension basis (% of gross)"><StyledInput type="number" step="0.01" value={form.pensionBasisPct} onChange={(e) => update("pensionBasisPct", Number(e.target.value))} /></Field>
-        <div className="grid grid-cols-2 gap-2">
-          <Field label="Ouderdomspensioen (%)"><StyledInput type="number" step="0.01" value={form.ouderdomspensioenPct} onChange={(e) => update("ouderdomspensioenPct", Number(e.target.value))} /></Field>
-          <Field label="Nabestaandenpensioen (%)"><StyledInput type="number" step="0.01" value={form.nabestaandenpensioenPct} onChange={(e) => update("nabestaandenpensioenPct", Number(e.target.value))} /></Field>
-          <Field label="W.G.A. (%)"><StyledInput type="number" step="0.01" value={form.wgaPct} onChange={(e) => update("wgaPct", Number(e.target.value))} /></Field>
-          <Field label="Premie HOP (%)"><StyledInput type="number" step="0.01" value={form.premieHopPct} onChange={(e) => update("premieHopPct", Number(e.target.value))} /></Field>
+        <p className="text-xs mb-3" style={{ color: C.inkSoft }}>
+          Ouderdomspensioen uses the PH&amp;C franchise, calculated cumulatively across the year:
+          basis = gross − franchise × paid hours (rounded up). For 2026 the franchise is
+          €15,308/yr ÷ 1976 h = €7.746964/h; it changes every January. Set the restart month to
+          when you joined your current employer — the cumulative calculation starts over there.
+        </p>
+        <div className="grid grid-cols-2 gap-2 mb-1">
+          <Field label="Franchise (€/hour)"><StyledInput type="number" step="0.000001" value={form.franchisePerHour} onChange={(e) => update("franchisePerHour", e.target.value)} /></Field>
+          <Field label="Pension restarts from"><StyledInput type="month" value={form.pensionResetMonth || ""} onChange={(e) => update("pensionResetMonth", e.target.value)} /></Field>
         </div>
+        <div className="grid grid-cols-2 gap-2">
+          <Field label="Ouderdomspensioen (%)"><StyledInput type="number" step="0.01" value={form.ouderdomspensioenPct} onChange={(e) => update("ouderdomspensioenPct", e.target.value)} /></Field>
+          <Field label="Nabestaandenpensioen (%)"><StyledInput type="number" step="0.01" value={form.nabestaandenpensioenPct} onChange={(e) => update("nabestaandenpensioenPct", e.target.value)} /></Field>
+          <Field label="W.G.A. (%)"><StyledInput type="number" step="0.01" value={form.wgaPct} onChange={(e) => update("wgaPct", e.target.value)} /></Field>
+          <Field label="Premie HOP (%)"><StyledInput type="number" step="0.01" value={form.premieHopPct} onChange={(e) => update("premieHopPct", e.target.value)} /></Field>
+        </div>
+        <p className="text-xs" style={{ color: C.inkSoft }}>
+          Nabestaanden &amp; HOP apply to full gross; W.G.A. applies to heffingsloon
+          (gross − pension deductions).
+        </p>
       </Card>
 
       <Card className="mb-4">
@@ -1748,25 +2001,23 @@ function SettingsPage({ settings, onSave }) {
         <p className="text-xs mb-3" style={{ color: C.inkSoft }}>
           Used as the fallback goal for any month that doesn't have its own custom goal. Set a custom goal for a specific month right on the Dashboard.
         </p>
-        <Field label="Default monthly goal (€)"><StyledInput type="number" step="1" value={form.monthlyGoal} onChange={(e) => update("monthlyGoal", Number(e.target.value))} /></Field>
+        <Field label="Default monthly goal (€)"><StyledInput type="number" step="1" value={form.monthlyGoal} onChange={(e) => update("monthlyGoal", e.target.value)} /></Field>
       </Card>
 
-      <PillButton onClick={() => { onSave(form); setSaved(true); }} bg={C.pink} bgDeep={C.pinkDeep} className="w-full">
-        {saved ? "Saved ✓" : "Save Settings"}
-      </PillButton>
-
       <p className="text-xs mt-4 leading-relaxed" style={{ color: C.inkSoft }}>
-        Gross pay = hours × the rate effective on that date, plus vakantieuren and vakantiegeld (both calculated on the base wage).
-        The pension basis is a percentage of that gross, and Ouderdomspensioen, Nabestaandenpensioen, W.G.A. and Premie HOP are each
-        deducted from that basis. Income tax isn't calculated automatically — enter your own on the Dashboard once you've worked it
-        out. Tips are added on top of everything and are never taxed.
+        Monthly pay follows your payslip exactly: loon = hours × rate; vrije dagen = loon × 10.64%;
+        vakantiegeld = 8% of (loon + vrije dagen); maaltijd = €4.05 per 7.6-hour loondag (added to
+        gross, deducted from net); ouderdomspensioen = 8.4% of the cumulative franchise basis;
+        nabestaandenpensioen and HOP on full gross; W.G.A. on heffingsloon. Loonheffing (income
+        tax) comes from the official tax tables and isn't predicted. Tips are added on top and
+        never taxed.
       </p>
     </div>
   );
 }
 
 /* ---------- Modals ---------- */
-function AddWorkModal({ settings, onClose, onSave }) {
+function AddWorkModal({ settings, workDays, onClose, onSave }) {
   const [date, setDate] = useState(todayStr());
   const [start, setStart] = useState("17:00");
   const [end, setEnd] = useState("22:30");
@@ -1774,7 +2025,11 @@ function AddWorkModal({ settings, onClose, onSave }) {
 
   const hours = calcHoursDecimal(start, end, breakMin);
   const rate = getRateForDate(settings.rateHistory, date);
-  const { gross, net } = calcPay(hours, rate, settings);
+  // What this shift adds to its month, incl. vakantiegeld, meal & pension.
+  const { gross, net } = useMemo(
+    () => marginalShiftPay(workDays, settings, { id: "__preview__", date, start, end, breakMin: Number(breakMin) || 0 }),
+    [workDays, settings, date, start, end, breakMin]
+  );
 
   return (
     <Modal title="Add Work Day 🍒" onClose={onClose}>
@@ -1808,7 +2063,7 @@ function AddWorkModal({ settings, onClose, onSave }) {
   );
 }
 
-function EditWorkModal({ settings, entry, onClose, onSave }) {
+function EditWorkModal({ settings, workDays, entry, onClose, onSave }) {
   const [date, setDate] = useState(entry.date);
   const [start, setStart] = useState(entry.start);
   const [end, setEnd] = useState(entry.end);
@@ -1816,7 +2071,11 @@ function EditWorkModal({ settings, entry, onClose, onSave }) {
 
   const hours = calcHoursDecimal(start, end, breakMin);
   const rate = getRateForDate(settings.rateHistory, date);
-  const { gross, net } = calcPay(hours, rate, settings);
+  // What this (edited) shift contributes to its month, incl. everything.
+  const { gross, net } = useMemo(
+    () => marginalShiftPay(workDays, settings, { id: entry.id, date, start, end, breakMin: Number(breakMin) || 0 }, entry.id),
+    [workDays, settings, entry.id, date, start, end, breakMin]
+  );
 
   return (
     <Modal title="Edit Work Day ✏️" onClose={onClose}>
