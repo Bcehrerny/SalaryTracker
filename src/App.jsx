@@ -2,6 +2,7 @@ import React, { useState, useEffect, useMemo } from "react";
 import {
   Home, Clock, Coins, BarChart3, TrendingUp, Settings as SettingsIcon,
   Plus, X, Trash2, ChevronLeft, ChevronRight, ChevronDown, Target, Pencil, Heart, Sparkles, AlertCircle,
+  Users,
 } from "lucide-react";
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
@@ -84,6 +85,19 @@ function FontLoader() {
       body { font-family: ${FONT_BODY}; }
       input[type="date"]::-webkit-calendar-picker-indicator,
       input[type="time"]::-webkit-calendar-picker-indicator { opacity: 0.6; }
+      /* Chrome lays a time input out as a flex row: [datetime-edit][picker icon].
+         Pull the icon out of flow and stretch the edit + its fields wrapper to the
+         full width, otherwise there is nothing for justify-content to center in. */
+      input[type="time"].center-time { position: relative; text-align: center; }
+      input[type="time"].center-time::-webkit-calendar-picker-indicator {
+        position: absolute; right: 0.35rem; top: 50%; transform: translateY(-50%); margin: 0; padding: 0;
+      }
+      input[type="time"].center-time::-webkit-datetime-edit {
+        flex: 1 1 auto; width: 100%; text-align: center;
+      }
+      input[type="time"].center-time::-webkit-datetime-edit-fields-wrapper {
+        display: flex; width: 100%; justify-content: center;
+      }
       ::-webkit-scrollbar { width: 6px; height: 6px; }
       ::-webkit-scrollbar-thumb { background: ${C.line}; border-radius: 10px; }
     `}</style>
@@ -360,6 +374,24 @@ function periodForDay(day) {
 const TIP_SPLIT_TIME = "17:00";
 const KITCHEN_SHARE_PCT = 50;
 
+// the people you might share a shift with — picked from a dropdown so names stay
+// consistent across estimates. Anyone left unnamed is grouped as "Others".
+const COWORKER_ROSTER = [
+  "Keissy", "Zora", "Joe", "Jeyoun", "Ludvig", "Miko", "Jingya", "Tiffany", "Leana",
+  "Chiyu", "Jaewoo", "Juae", "Charley", "Binxin", "Abby", "George", "Zhirang", "Woojay",
+];
+const ME_NAME = "Me";
+const OTHERS_NAME = "Others";
+
+// a soft color per person so the same face keeps the same color everywhere
+const PERSON_COLORS = [C.pinkText, C.sageText, C.blueText, C.honeyText, C.lavenderDeep, C.roseDeep, C.sageDeep, C.blueDeep];
+function colorForName(name) {
+  if (name === ME_NAME) return C.pinkText;
+  let hash = 0;
+  for (let i = 0; i < (name || "").length; i++) hash = (hash * 31 + name.charCodeAt(i)) >>> 0;
+  return PERSON_COLORS[hash % PERSON_COLORS.length];
+}
+
 // how many hours a shift falls before/after the split time
 function splitHoursAroundTime(start, end, splitTime) {
   let s = timeToMinutes(start);
@@ -384,27 +416,69 @@ function calcTipSplit({ myShift, colleagues, tipBefore, tipClosing, splitTime = 
   const beforePoolStaff = before * staffFactor;
   const eveningPoolStaff = eveningTotal * staffFactor;
 
-  const all = [myShift, ...(colleagues || [])].filter((p) => p && p.start && p.end);
+  const all = [
+    { id: "me", name: ME_NAME, isMe: true, start: myShift?.start, end: myShift?.end },
+    ...(colleagues || []).map((c, i) => ({
+      id: c.id || `col-${i}`,
+      name: (c.name || "").trim() || OTHERS_NAME,
+      isMe: false,
+      start: c.start,
+      end: c.end,
+    })),
+  ].filter((p) => p && p.start && p.end);
+
   const withHours = all.map((p) => ({ ...p, ...splitHoursAroundTime(p.start, p.end, splitTime) }));
 
   const totalBeforeH = withHours.reduce((s, p) => s + p.beforeH, 0);
   const totalEveningH = withHours.reduce((s, p) => s + p.eveningH, 0);
 
-  const me = withHours[0] || { beforeH: 0, eveningH: 0 };
-  const myBeforeShare = totalBeforeH > 0 ? beforePoolStaff * (me.beforeH / totalBeforeH) : 0;
-  const myEveningShare = totalEveningH > 0 ? eveningPoolStaff * (me.eveningH / totalEveningH) : 0;
+  // everyone's cut, proportional to the hours they worked inside each pool
+  const people = withHours.map((p) => {
+    const beforeShare = totalBeforeH > 0 ? beforePoolStaff * (p.beforeH / totalBeforeH) : 0;
+    const eveningShare = totalEveningH > 0 ? eveningPoolStaff * (p.eveningH / totalEveningH) : 0;
+    return { ...p, beforeShare, eveningShare, total: beforeShare + eveningShare };
+  });
+
+  // several unnamed coworkers all read as "Others", so number them for display
+  const counts = {};
+  people.forEach((p) => { counts[p.name] = (counts[p.name] || 0) + 1; });
+  const seen = {};
+  people.forEach((p) => {
+    if (counts[p.name] > 1) {
+      seen[p.name] = (seen[p.name] || 0) + 1;
+      p.displayName = `${p.name} ${seen[p.name]}`;
+    } else {
+      p.displayName = p.name;
+    }
+  });
+
+  const me = people.find((p) => p.isMe) || {
+    beforeH: 0, eveningH: 0, beforeShare: 0, eveningShare: 0, total: 0,
+  };
 
   return {
+    people,
     beforePoolStaff,
     eveningPoolStaff,
     totalBeforeH,
     totalEveningH,
     myBeforeH: me.beforeH,
     myEveningH: me.eveningH,
-    myBeforeShare,
-    myEveningShare,
-    myTotal: myBeforeShare + myEveningShare,
+    myBeforeShare: me.beforeShare,
+    myEveningShare: me.eveningShare,
+    myTotal: me.total,
   };
+}
+
+// recompute an estimate's full breakdown from its stored raw inputs, so old
+// records (saved before names existed) still work — they just show as "Others"
+function peopleForEstimate(e) {
+  return calcTipSplit({
+    myShift: { start: e.myStart, end: e.myEnd },
+    colleagues: e.colleagues,
+    tipBefore: e.tipBefore,
+    tipClosing: e.tipClosing,
+  }).people;
 }
 function migrateTips(rawTips) {
   const buckets = {};
@@ -607,10 +681,15 @@ function Modal({ title, onClose, children }) {
   );
 }
 
-function Field({ label, children }) {
+function Field({ label, children, center }) {
   return (
-    <div className="mb-3">
-      <label className="block text-[11px] font-bold mb-1" style={{ color: C.inkSoft }}>{label}</label>
+    <div className="mb-3" style={{ minWidth: 0 }}>
+      <label
+        className="block text-[11px] font-bold mb-1"
+        style={{ color: C.inkSoft, textAlign: center ? "center" : "left" }}
+      >
+        {label}
+      </label>
       {children}
     </div>
   );
@@ -618,6 +697,7 @@ function Field({ label, children }) {
 
 const inputStyle = {
   width: "100%",
+  minWidth: 0,
   background: C.cardAlt,
   border: `2px solid ${C.line}`,
   borderRadius: "0.9rem",
@@ -628,6 +708,24 @@ const inputStyle = {
 };
 function StyledInput(props) {
   return <input {...props} style={{ ...inputStyle, ...(props.style || {}) }} />;
+}
+
+function StyledSelect({ children, style = {}, ...props }) {
+  return (
+    <select
+      {...props}
+      style={{
+        ...inputStyle,
+        appearance: "none",
+        fontWeight: 700,
+        fontFamily: FONT_BODY,
+        cursor: "pointer",
+        ...style,
+      }}
+    >
+      {children}
+    </select>
+  );
 }
 
 function PillButton({ children, onClick, bg = C.pink, bgDeep = C.pinkDeep, text = C.white, disabled, style = {}, className = "" }) {
@@ -1398,48 +1496,177 @@ function TipsPage({
           🧮 Calculate today's tip
         </PillButton>
         {monthEstimates && monthEstimates.length > 0 && (
-          <>
-            <Card className="mb-3" accent={C.blue}>
-              <StatBlock
-                label="Predicted Tips Total"
-                value={fmtEuro(monthEstimates.reduce((s, e) => s + (e.myTotal || 0), 0))}
-                accent={C.blueText}
-                sub={`${monthEstimates.length} shift${monthEstimates.length === 1 ? "" : "s"} estimated`}
-              />
-            </Card>
-            <div className="grid grid-cols-2 gap-2">
-              {monthEstimates
-                .slice()
-                .sort((a, b) => b.date.localeCompare(a.date))
-                .map((e) => (
-                  <Card key={e.id} accent={C.blue} style={{ cursor: "pointer" }}>
-                    <div onClick={() => onEditEstimate(e)}>
-                      <p className="text-[10px] font-bold" style={{ color: C.inkSoft }}>{shiftDayLabel(e.date)}</p>
-                      <p className="text-[10px]" style={{ color: C.inkSoft }}>{e.myStart}–{e.myEnd}</p>
-                      <p className="text-base font-extrabold mt-1" style={{ color: C.blueText, fontFamily: FONT_DISPLAY }}>
-                        {fmtEuro(e.myTotal)}
-                      </p>
-                    </div>
-                    <div className="flex items-center justify-end gap-2 mt-1.5">
-                      <button onClick={() => onEditEstimate(e)}>
-                        <Pencil size={12} style={{ color: C.inkSoft }} />
-                      </button>
-                      <button
-                        onClick={(ev) => {
-                          ev.stopPropagation();
-                          onDeleteEstimate(e.id);
-                        }}
-                      >
-                        <Trash2 size={13} style={{ color: C.inkSoft }} />
-                      </button>
-                    </div>
-                  </Card>
-                ))}
-            </div>
-          </>
+          <EstimatesReview
+            monthEstimates={monthEstimates}
+            onEditEstimate={onEditEstimate}
+            onDeleteEstimate={onDeleteEstimate}
+          />
         )}
       </div>
     </div>
+  );
+}
+
+/* Predicted tips, viewable per person: pick a name and the month total plus each
+   shift below switches to that person's share. */
+function EstimatesReview({ monthEstimates, onEditEstimate, onDeleteEstimate }) {
+  const [who, setWho] = useState(ME_NAME);
+  const [expanded, setExpanded] = useState(null);
+
+  // recomputed from raw inputs, so edits and old records stay in sync
+  const rows = useMemo(
+    () =>
+      monthEstimates
+        .slice()
+        .sort((a, b) => b.date.localeCompare(a.date))
+        .map((e) => ({ e, people: peopleForEstimate(e) })),
+    [monthEstimates]
+  );
+
+  // one entry per person, with their month total and how many shifts they were on
+  const participants = useMemo(() => {
+    const map = new Map();
+    rows.forEach(({ people }) => {
+      const byName = {};
+      people.forEach((p) => {
+        byName[p.name] = (byName[p.name] || 0) + p.total;
+      });
+      Object.entries(byName).forEach(([name, total]) => {
+        const cur = map.get(name) || { name, isMe: name === ME_NAME, total: 0, shifts: 0 };
+        cur.total += total;
+        cur.shifts += 1;
+        map.set(name, cur);
+      });
+    });
+    return Array.from(map.values()).sort((a, b) =>
+      a.isMe ? -1 : b.isMe ? 1 : b.total - a.total
+    );
+  }, [rows]);
+
+  const active =
+    participants.find((p) => p.name === who) || participants[0] || { name: ME_NAME, total: 0, shifts: 0, isMe: true };
+  const activeColor = colorForName(active.name);
+
+  // only the shifts this person actually worked
+  const activeRows = rows
+    .map(({ e, people }) => {
+      const mine = people.filter((p) => p.name === active.name);
+      if (!mine.length) return null;
+      return {
+        e,
+        people,
+        total: mine.reduce((s, p) => s + p.total, 0),
+        window: mine.length === 1 ? `${mine[0].start}–${mine[0].end}` : `${mine.length} people`,
+      };
+    })
+    .filter(Boolean);
+
+  return (
+    <>
+      <Card className="mb-3" accent={C.blue}>
+        <div className="flex items-start justify-between gap-2">
+          <div style={{ minWidth: 0 }}>
+            <StatBlock
+              label="Predicted Tips Total"
+              value={fmtEuro(active.total)}
+              accent={activeColor}
+              sub={`${active.shifts} shift${active.shifts === 1 ? "" : "s"} estimated`}
+            />
+          </div>
+          {participants.length > 1 && (
+            <div style={{ flexShrink: 0, maxWidth: "45%" }}>
+              <div className="flex items-center gap-1 mb-1 justify-center">
+                <Users size={11} style={{ color: C.inkSoft }} />
+                <span className="text-[9px] font-bold uppercase" style={{ color: C.inkSoft }}>Show</span>
+              </div>
+              <StyledSelect
+                value={active.name}
+                onChange={(ev) => { setWho(ev.target.value); setExpanded(null); }}
+                style={{
+                  padding: "0.35rem 0.5rem",
+                  fontSize: "0.75rem",
+                  borderRadius: "0.75rem",
+                  color: activeColor,
+                  textAlign: "center",
+                  textAlignLast: "center",
+                }}
+              >
+                {participants.map((p) => (
+                  <option key={p.name} value={p.name}>
+                    {p.isMe ? "Me" : p.name}
+                  </option>
+                ))}
+              </StyledSelect>
+            </div>
+          )}
+        </div>
+      </Card>
+
+      <div className="grid grid-cols-2 gap-2">
+        {activeRows.map(({ e, people, total, window }) => {
+          const open = expanded === e.id;
+          return (
+            <Card key={e.id} accent={C.blue}>
+              <div style={{ cursor: "pointer" }} onClick={() => onEditEstimate(e)}>
+                <p className="text-[10px] font-bold" style={{ color: C.inkSoft }}>{shiftDayLabel(e.date)}</p>
+                <p className="text-[10px]" style={{ color: C.inkSoft }}>{window}</p>
+                <p className="text-base font-extrabold mt-1 tabular-nums" style={{ color: activeColor, fontFamily: FONT_DISPLAY }}>
+                  {fmtEuro(total)}
+                </p>
+              </div>
+
+              <div className="flex items-center justify-between gap-2 mt-1.5">
+                {people.length > 1 ? (
+                  <button
+                    onClick={() => setExpanded(open ? null : e.id)}
+                    className="flex items-center gap-0.5 text-[10px] font-bold"
+                    style={{ color: C.blueText }}
+                  >
+                    <Users size={11} />
+                    {people.length}
+                    <ChevronDown
+                      size={10}
+                      style={{ transform: open ? "rotate(180deg)" : "none", transition: "transform .15s" }}
+                    />
+                  </button>
+                ) : (
+                  <span />
+                )}
+                <div className="flex items-center gap-2">
+                  <button onClick={() => onEditEstimate(e)}>
+                    <Pencil size={12} style={{ color: C.inkSoft }} />
+                  </button>
+                  <button onClick={(ev) => { ev.stopPropagation(); onDeleteEstimate(e.id); }}>
+                    <Trash2 size={13} style={{ color: C.inkSoft }} />
+                  </button>
+                </div>
+              </div>
+
+              {open && people.length > 1 && (
+                <div className="flex flex-col gap-1 mt-1.5 pt-1.5" style={{ borderTop: `1.5px solid ${C.line}` }}>
+                  {people
+                    .slice()
+                    .sort((a, b) => b.total - a.total)
+                    .map((p) => (
+                      <div key={p.id} className="flex items-center justify-between gap-1">
+                        <span
+                          className="text-[10px] font-bold truncate"
+                          style={{ color: colorForName(p.name), opacity: p.name === active.name ? 1 : 0.7 }}
+                        >
+                          {p.isMe ? "Me" : p.displayName}
+                        </span>
+                        <span className="text-[10px] font-extrabold tabular-nums" style={{ color: C.ink }}>
+                          {fmtEuro(p.total)}
+                        </span>
+                      </div>
+                    ))}
+                </div>
+              )}
+            </Card>
+          );
+        })}
+      </div>
+    </>
   );
 }
 
@@ -1491,17 +1718,26 @@ function TipCalculatorModal({ onClose, onSave, initial }) {
   const [colleagues, setColleagues] = useState(
     initial?.colleagues ? initial.colleagues.map((c) => ({ ...c, id: c.id || uid() })) : []
   );
+  const [newColName, setNewColName] = useState("");
   const [newColStart, setNewColStart] = useState("17:00");
   const [newColEnd, setNewColEnd] = useState("22:30");
   const [tipBefore, setTipBefore] = useState(initial?.tipBefore != null ? String(initial.tipBefore) : "");
   const [tipClosing, setTipClosing] = useState(initial?.tipClosing != null ? String(initial.tipClosing) : "");
 
+  // names already on today's shift shouldn't show up in the dropdown twice
+  const takenNames = new Set(colleagues.map((c) => (c.name || "").trim()).filter(Boolean));
+  const availableNames = COWORKER_ROSTER.filter((n) => !takenNames.has(n));
+
   function addColleague() {
     if (!newColStart || !newColEnd) return;
-    setColleagues([...colleagues, { id: uid(), start: newColStart, end: newColEnd }]);
+    setColleagues([...colleagues, { id: uid(), name: newColName, start: newColStart, end: newColEnd }]);
+    setNewColName("");
   }
   function removeColleague(id) {
     setColleagues(colleagues.filter((c) => c.id !== id));
+  }
+  function renameColleague(id, name) {
+    setColleagues(colleagues.map((c) => (c.id === id ? { ...c, name } : c)));
   }
 
   const result = calcTipSplit({
@@ -1524,8 +1760,12 @@ function TipCalculatorModal({ onClose, onSave, initial }) {
       <div className="rounded-2xl p-3 mb-3" style={{ background: C.cardAlt, border: `1.5px solid ${C.line}` }}>
         <p className="text-xs font-bold mb-2" style={{ color: C.pinkText }}>My Shift</p>
         <div className="grid grid-cols-2 gap-2">
-          <Field label="Start"><StyledInput type="time" value={myStart} onChange={(e) => setMyStart(e.target.value)} /></Field>
-          <Field label="End"><StyledInput type="time" value={myEnd} onChange={(e) => setMyEnd(e.target.value)} /></Field>
+          <Field label="Start" center>
+            <StyledInput className="center-time" type="time" value={myStart} onChange={(e) => setMyStart(e.target.value)} style={{ textAlign: "center" }} />
+          </Field>
+          <Field label="End" center>
+            <StyledInput className="center-time" type="time" value={myEnd} onChange={(e) => setMyEnd(e.target.value)} style={{ textAlign: "center" }} />
+          </Field>
         </div>
       </div>
 
@@ -1536,23 +1776,80 @@ function TipCalculatorModal({ onClose, onSave, initial }) {
         )}
         {colleagues.length > 0 && (
           <div className="flex flex-col gap-2 mb-2">
-            {colleagues.map((c) => (
-              <div
-                key={c.id}
-                className="flex items-center justify-between rounded-xl px-2.5 py-1.5"
-                style={{ background: C.card, border: `1.5px solid ${C.line}` }}
-              >
-                <span className="text-xs font-bold" style={{ color: C.ink }}>{c.start} – {c.end}</span>
-                <button onClick={() => removeColleague(c.id)}>
-                  <Trash2 size={13} style={{ color: C.inkSoft }} />
-                </button>
-              </div>
-            ))}
+            {colleagues.map((c) => {
+              const name = (c.name || "").trim();
+              return (
+                <div
+                  key={c.id}
+                  className="grid items-center gap-2 rounded-xl px-2 py-1.5"
+                  style={{ gridTemplateColumns: "1fr 3fr", background: C.card, border: `1.5px solid ${C.line}` }}
+                >
+                  <StyledSelect
+                    value={name}
+                    onChange={(e) => renameColleague(c.id, e.target.value)}
+                    style={{
+                      padding: "0.25rem 0.3rem",
+                      fontSize: "0.7rem",
+                      borderRadius: "0.6rem",
+                      background: C.cardAlt,
+                      textAlign: "center",
+                      textAlignLast: "center",
+                      color: name ? colorForName(name) : C.inkSoft,
+                    }}
+                  >
+                    <option value="">{OTHERS_NAME}</option>
+                    {COWORKER_ROSTER.filter((n) => n === name || !takenNames.has(n)).map((n) => (
+                      <option key={n} value={n}>{n}</option>
+                    ))}
+                  </StyledSelect>
+                  <div className="relative flex items-center justify-center min-w-0">
+                    <span className="text-xs font-bold whitespace-nowrap" style={{ color: C.ink }}>
+                      {c.start} – {c.end}
+                    </span>
+                    <button
+                      onClick={() => removeColleague(c.id)}
+                      className="absolute"
+                      style={{ right: 0, top: "50%", transform: "translateY(-50%)" }}
+                    >
+                      <Trash2 size={13} style={{ color: C.inkSoft }} />
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
           </div>
         )}
-        <div className="grid grid-cols-2 gap-2 mb-2">
-          <Field label="Start"><StyledInput type="time" value={newColStart} onChange={(e) => setNewColStart(e.target.value)} /></Field>
-          <Field label="End"><StyledInput type="time" value={newColEnd} onChange={(e) => setNewColEnd(e.target.value)} /></Field>
+        <div className="grid gap-2 mb-2 items-end" style={{ gridTemplateColumns: "1fr 1.5fr 1.5fr" }}>
+          <Field label="Who" center>
+            <StyledSelect
+              value={newColName}
+              onChange={(e) => setNewColName(e.target.value)}
+              style={{
+                padding: "0.5rem 0.3rem",
+                fontSize: "0.7rem",
+                textAlign: "center",
+                textAlignLast: "center",
+                color: newColName ? colorForName(newColName) : C.inkSoft,
+              }}
+            >
+              <option value="">{OTHERS_NAME}</option>
+              {availableNames.map((n) => (
+                <option key={n} value={n}>{n}</option>
+              ))}
+            </StyledSelect>
+          </Field>
+          <Field label="Start" center>
+            <StyledInput
+              className="center-time" type="time" value={newColStart} onChange={(e) => setNewColStart(e.target.value)}
+              style={{ padding: "0.5rem 0.4rem", fontSize: "0.8rem", textAlign: "center" }}
+            />
+          </Field>
+          <Field label="End" center>
+            <StyledInput
+              className="center-time" type="time" value={newColEnd} onChange={(e) => setNewColEnd(e.target.value)}
+              style={{ padding: "0.5rem 0.4rem", fontSize: "0.8rem", textAlign: "center" }}
+            />
+          </Field>
         </div>
         <PillButton onClick={addColleague} bg={C.blue} bgDeep={C.blueDeep} className="py-2 w-full">
           <Plus size={15} /> Add Coworker
@@ -1583,6 +1880,35 @@ function TipCalculatorModal({ onClose, onSave, initial }) {
           <p className="text-[10px] font-bold uppercase" style={{ color: C.honeyText }}>You'll get about</p>
           <p className="text-2xl font-extrabold" style={{ color: C.honeyText, fontFamily: FONT_DISPLAY }}>{fmtEuro(result.myTotal)}</p>
         </div>
+
+        {result.people.length > 1 && (
+          <div className="mt-3 pt-2" style={{ borderTop: `1.5px solid ${C.line}` }}>
+            <p className="text-[10px] font-bold uppercase mb-1.5" style={{ color: C.inkSoft }}>
+              Everyone on today's shift
+            </p>
+            <div className="flex flex-col gap-1">
+              {result.people
+                .slice()
+                .sort((a, b) => (a.isMe ? -1 : b.isMe ? 1 : b.total - a.total))
+                .map((p) => (
+                  <div key={p.id} className="flex items-center justify-between gap-2">
+                    <span
+                      className="text-[11px] font-bold truncate"
+                      style={{ color: p.isMe ? C.pinkText : colorForName(p.name) }}
+                    >
+                      {p.isMe ? "Me" : p.displayName}
+                      <span className="font-normal ml-1" style={{ color: C.inkSoft }}>
+                        {p.start}–{p.end}
+                      </span>
+                    </span>
+                    <span className="text-[11px] font-extrabold tabular-nums" style={{ color: C.ink }}>
+                      {fmtEuro(p.total)}
+                    </span>
+                  </div>
+                ))}
+            </div>
+          </div>
+        )}
       </div>
 
       <PillButton
